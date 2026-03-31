@@ -38,8 +38,8 @@ Enrich your CRM account records with Grizz construction company data — firmogr
 **1. Clone the repo**
 
 ```bash
-git clone https://github.com/getgrizz/grizz-crm-enrichment.git
-cd grizz-crm-enrichment
+git clone https://github.com/getgrizz/grizz-utilities.git
+cd grizz-utilities
 ```
 
 **2. Create and activate a virtual environment**
