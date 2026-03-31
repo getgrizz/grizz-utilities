@@ -1,0 +1,19 @@
+# Credentials — never commit these
+.env
+config.yaml
+
+# Output files
+csv/
+csv_out/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db

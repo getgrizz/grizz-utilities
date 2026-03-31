@@ -1,0 +1,73 @@
+# Grizz CRM Enrichment — Field Mapping Configuration
+#
+# Copy this file to config.yaml and edit to match your Salesforce field API names.
+# Each entry maps a Grizz field (left) to your Salesforce field API name (right).
+#
+# Field naming conventions and setup instructions:
+#   https://getgrizz.com/docs/crm-fields/
+#
+# All Grizz_ custom fields must be created in Salesforce before running:
+#   Setup > Object Manager > Account > Fields & Relationships > New
+#
+# Remove any lines you don't want to sync.
+
+salesforce:
+  domain_field: Website
+
+  field_mapping:
+
+    # ── Company Identity ───────────────────────────────────────────────────────
+    grizz_id:           Grizz_Company_ID__c
+    grizz_url:          Grizz_URL__c
+    company_name:       Grizz_Company_Name__c
+    domain:             Grizz_Domain__c
+    linkedin_url:       Grizz_LinkedIn_URL__c
+    company_description: Grizz_Company_Description__c
+
+    # ── Contact & Location ─────────────────────────────────────────────────────
+    phone:                 Grizz_HQ_Phone__c
+    email:                 Grizz_HQ_Email__c
+    city:                  Grizz_HQ_City__c
+    state_province_region: Grizz_HQ_Region__c
+    country:               Grizz_HQ_Country__c
+
+    # ── Firmographics ──────────────────────────────────────────────────────────
+    employee_range: Grizz_Employee_Range__c
+    naics_code:     Grizz_NAICS__c
+
+    # ── ERP Intelligence ───────────────────────────────────────────────────────
+    erp_tech_stack:    Grizz_ERP__c
+    erp_match_type:     Grizz_ERP_Match_Type__c
+    erp_keyword_usage: Grizz_ERP_Keyword_Usage__c
+
+    # ── ATS Intelligence ───────────────────────────────────────────────────────
+    ats_tech_stack:    Grizz_ATS__c
+    ats_match_type:     Grizz_ATS_Match_Type__c
+    ats_keyword_usage: Grizz_ATS_Keyword_Usage__c
+
+    # ── Other Technology Signals ───────────────────────────────────────────────
+    other_tech_signals: Grizz_Other_Tech_Signals__c
+
+
+# ── HubSpot (coming soon) ──────────────────────────────────────────────────────
+# hubspot:
+#   domain_field: domain
+#   field_mapping:
+#     grizz_id:              grizz_company_id
+#     grizz_url:             grizz_url
+#     company_name:          grizz_company_name
+#     domain:                grizz_domain
+#     linkedin_url:          grizz_linkedin_url
+#     company_description:   grizz_company_description
+#     phone:                 grizz_hq_phone
+#     email:                 grizz_hq_email
+#     city:                  grizz_hq_city
+#     state_province_region: grizz_hq_region
+#     country:               grizz_hq_country
+#     employee_range:        grizz_employee_range
+#     naics_code:            grizz_naics
+#     erp_tech_stack:        grizz_erp
+#     erp_match_type:         grizz_erp_match_type
+#     ats_tech_stack:        grizz_ats
+#     ats_match_type:         grizz_ats_match_type
+#     other_tech_signals:    grizz_other_tech_signals
