@@ -32,8 +32,10 @@ salesforce:
     country:               Grizz_HQ_Country__c
 
     # ── Firmographics ──────────────────────────────────────────────────────────
-    employee_range: Grizz_Employee_Range__c
-    naics_code:     Grizz_NAICS__c
+    employee_range:  Grizz_Employee_Range__c
+    revenue_range:   Grizz_Revenue_Range__c
+    naics_code:      Grizz_NAICS__c
+    grizz_activity:  Grizz_Activity__c
 
     # ── ERP Intelligence ───────────────────────────────────────────────────────
     erp_tech_stack:    Grizz_ERP__c
@@ -49,25 +51,44 @@ salesforce:
     other_tech_signals: Grizz_Other_Tech_Signals__c
 
 
-# ── HubSpot (coming soon) ──────────────────────────────────────────────────────
-# hubspot:
-#   domain_field: domain
-#   field_mapping:
-#     grizz_id:              grizz_company_id
-#     grizz_url:             grizz_url
-#     company_name:          grizz_company_name
-#     domain:                grizz_domain
-#     linkedin_url:          grizz_linkedin_url
-#     company_description:   grizz_company_description
-#     phone:                 grizz_hq_phone
-#     email:                 grizz_hq_email
-#     city:                  grizz_hq_city
-#     state_province_region: grizz_hq_region
-#     country:               grizz_hq_country
-#     employee_range:        grizz_employee_range
-#     naics_code:            grizz_naics
-#     erp_tech_stack:        grizz_erp
-#     erp_match_type:         grizz_erp_match_type
-#     ats_tech_stack:        grizz_ats
-#     ats_match_type:         grizz_ats_match_type
-#     other_tech_signals:    grizz_other_tech_signals
+# ── HubSpot ────────────────────────────────────────────────────────────────────
+# Run `python run.py setup --crm hubspot` to create these properties first.
+
+hubspot:
+  domain_field: domain
+
+  field_mapping:
+
+    # ── Company Identity ───────────────────────────────────────────────────────
+    grizz_id:              grizz_company_id
+    grizz_url:             grizz_url
+    company_name:          grizz_company_name
+    domain:                grizz_domain
+    linkedin_url:          grizz_linkedin_url
+    company_description:   grizz_company_description
+
+    # ── Contact & Location ─────────────────────────────────────────────────────
+    phone:                 grizz_hq_phone
+    email:                 grizz_hq_email
+    city:                  grizz_hq_city
+    state_province_region: grizz_hq_region
+    country:               grizz_hq_country
+
+    # ── Firmographics ──────────────────────────────────────────────────────────
+    employee_range:        grizz_employee_range
+    revenue_range:         grizz_revenue_range
+    naics_code:            grizz_naics
+    grizz_activity:        grizz_activity
+
+    # ── ERP Intelligence ───────────────────────────────────────────────────────
+    erp_tech_stack:        grizz_erp
+    erp_match_type:        grizz_erp_match_type
+    erp_keyword_usage:     grizz_erp_keyword_usage
+
+    # ── ATS Intelligence ───────────────────────────────────────────────────────
+    ats_tech_stack:        grizz_ats
+    ats_match_type:        grizz_ats_match_type
+    ats_keyword_usage:     grizz_ats_keyword_usage
+
+    # ── Other Technology Signals ───────────────────────────────────────────────
+    other_tech_signals:    grizz_other_tech_signals

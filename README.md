@@ -2,8 +2,8 @@
 
 Enrich your CRM account records with Grizz construction company data — firmographics, NAICS codes, addresses, and more.
 
-**Supported CRMs:** Salesforce
-**Coming soon:** HubSpot, Attio, Pipedrive, Zoho
+**Supported CRMs:** Salesforce, HubSpot
+**Coming soon:** Attio, Pipedrive, Zoho
 
 ---
 
@@ -29,7 +29,7 @@ Enrich your CRM account records with Grizz construction company data — firmogr
 
 - Python 3.9 or higher
 - A [Grizz API key](https://getgrizz.com/dashboard)
-- Salesforce credentials (username, password, security token)
+- Credentials for your CRM (see [Salesforce](#salesforce-api-credentials) or [HubSpot](#hubspot-api-credentials) below)
 
 ---
 
@@ -72,7 +72,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Open `.env` and fill in your Grizz API key and Salesforce credentials.
+Open `.env` and fill in your Grizz API key and the credentials for your CRM. See [Salesforce API credentials](#salesforce-api-credentials) or [HubSpot API credentials](#hubspot-api-credentials) below for step-by-step instructions.
 
 **5. Configure field mappings**
 
@@ -80,7 +80,7 @@ Open `.env` and fill in your Grizz API key and Salesforce credentials.
 cp config.example.yaml config.yaml
 ```
 
-Open `config.yaml` and map Grizz fields to your Salesforce field API names. See [Field Reference](#field-reference) below.
+Open `config.yaml` and map Grizz fields to your CRM's field names. The file contains sections for each supported CRM — fill in only the section for your CRM. See [Field Reference](#field-reference) below.
 
 ---
 
@@ -96,23 +96,28 @@ You'll be guided through CRM selection, file input, and options.
 
 ### Headless (for scripting and automation)
 
-**Create Grizz custom fields in Salesforce:**
+**Create Grizz custom fields in your CRM:**
 
 ```bash
-python run.py setup
+# Salesforce
+python run.py setup --crm salesforce
+
+# HubSpot
+python run.py setup --crm hubspot
 ```
 
-This creates all recommended Grizz custom fields on the Account object and configures field-level security. Safe to run multiple times — existing fields are skipped.
+This creates all recommended Grizz custom fields/properties on your Account (Salesforce) or Company (HubSpot) object. Safe to run multiple times — existing fields are skipped.
 
 **Enrich accounts from a CSV:**
 
 ```bash
 python run.py enrich --crm salesforce --input accounts.csv
+python run.py enrich --crm hubspot --input companies.csv
 ```
 
 | Flag | Description |
 |---|---|
-| `--crm` | CRM to use (`salesforce`) |
+| `--crm` | CRM to use: `salesforce` or `hubspot` |
 | `--input` | Path to CSV file with an `Id` or `Account ID` column |
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--dry-run` | Preview changes without writing to the CRM |
@@ -121,17 +126,17 @@ python run.py enrich --crm salesforce --input accounts.csv
 
 ```bash
 # Use an existing audience
-python run.py audience --audience-id <uuid>
+python run.py audience --crm salesforce --audience-id <uuid>
 
 # Or create a new audience from a prompt
-python run.py audience --prompt "Mid-market US roofing contractors"
+python run.py audience --crm hubspot --prompt "Mid-market US roofing contractors"
 ```
 
 | Flag | Description |
 |---|---|
 | `--audience-id` | ID of an existing Grizz audience |
 | `--prompt` | Natural language prompt to create a new audience |
-| `--crm` | CRM to use (`salesforce`) |
+| `--crm` | CRM to use: `salesforce` or `hubspot` |
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--batch-size` | Records per API call when creating accounts (default: `200`, max: `200`) |
 | `--dry-run` | Preview changes without writing to the CRM |
@@ -140,13 +145,12 @@ The audience command always saves a full copy of the audience to `csv_out/Audien
 
 ### CSV format
 
-The `enrich` command requires a CSV with one column named `Id` or `Account ID` containing Salesforce Account IDs:
+The `enrich` command requires a CSV with one column named `Id` or `Account ID` containing CRM record IDs:
 
 ```
 Id
 0011a00000XyzAbcAAE
 0011a00000XyzDefAAE
-0011a00000XyzGhiAAE
 ```
 
 Additional columns are ignored.
@@ -187,21 +191,67 @@ These Grizz fields are available for mapping in `config.yaml`:
 
 ---
 
-## Salesforce setup notes
+## Salesforce API credentials
 
-- The integration connects using **username + password + security token**. Reset your security token at: *Setup → My Personal Information → Reset My Security Token*
-- SOAP API login must be enabled: *Setup → User Interface → Enable SOAP API login()*. This is off by default in Developer Edition orgs created after Spring '23.
-- For sandbox orgs, set `SALESFORCE_DOMAIN=test` in your `.env`
-- Custom fields (e.g. `Grizz_NAICS_Code__c`) must be created in Salesforce before running: *Setup → Object Manager → Account → Fields & Relationships → New*
+The integration connects with your **username, password, and security token**. Here's how to get each:
+
+**Security token**
+
+1. Log into Salesforce
+2. Click your profile picture (top right) → *Settings*
+3. In the left sidebar go to *My Personal Information → Reset My Security Token*
+4. Click **Reset Security Token** — Salesforce will email it to you
+5. Add it to your `.env` as `SALESFORCE_SECURITY_TOKEN`
+
+**Other required values**
+
+| `.env` key | Where to find it |
+|---|---|
+| `SALESFORCE_USERNAME` | Your Salesforce login email |
+| `SALESFORCE_PASSWORD` | Your Salesforce password |
+| `SALESFORCE_DOMAIN` | Use `login` for production, `test` for sandbox |
+
+**Other notes**
+
+- SOAP API login must be enabled in your org: *Setup → User Interface → Enable SOAP API login*. This is off by default in Developer Edition orgs created after Spring '23.
+- Run `python run.py setup --crm salesforce` once to create all Grizz custom fields on the Account object.
 
 **Adding Grizz fields to your Lightning record page:**
 
-`python run.py setup` creates all Grizz fields and adds them to the classic Account page layout. If your org uses Lightning record pages (most do), you'll need to add the fields to your Lightning page once manually:
+The setup command adds fields to the classic page layout. If your org uses Lightning record pages (most do), add the fields manually once:
 
 1. Go to *Setup → Object Manager → Account → Lightning Record Pages*
 2. Click **Edit** on your Account record page
 3. Add a new section and drag the `Grizz_*` fields into it
 4. Save and activate
+
+---
+
+## HubSpot API credentials
+
+The integration uses a **Legacy App access token**. Here's how to create one:
+
+1. Log into your HubSpot developer account at [developers.hubspot.com](https://developers.hubspot.com)
+2. Go to *Developer Settings → Legacy Apps*
+3. Click **Create a new app**
+4. Give it a name (e.g. "Grizz Enrichment")
+5. Assign the following scopes:
+   - `crm.objects.companies.read`
+   - `crm.objects.companies.write`
+   - `crm.schemas.companies.read`
+   - `crm.schemas.companies.write`
+6. Save the app
+7. Copy the **Access token** from the app detail page
+8. Add it to your `.env` as `HUBSPOT_API_KEY`
+
+**Other notes**
+
+- Run `python run.py setup --crm hubspot` once to create the Grizz property group and all custom properties on Company records.
+- Properties are created in a **Grizz** group but won't appear on Company records automatically. To add them to the record view:
+  1. Open any Company record in HubSpot
+  2. Scroll to the bottom of the properties panel and click *Manage properties*
+  3. Search for "Grizz" and add the fields you want
+  4. On Enterprise, set a default layout for all users at: *Settings → Data Management → Record Customization*
 
 ---
 

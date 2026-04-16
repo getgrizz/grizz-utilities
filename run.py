@@ -28,7 +28,8 @@ from grizz_enrichment.adapters import ADAPTERS
 from grizz_enrichment.audience_client import fetch_audience, submit as submit_audience
 from grizz_enrichment.grizz_client import enrich as grizz_enrich
 from grizz_enrichment.mapper import apply_mapping
-from grizz_enrichment.setup_salesforce import run_setup
+from grizz_enrichment.setup_salesforce import run_setup as run_setup_salesforce
+from grizz_enrichment.setup_hubspot import run_setup as run_setup_hubspot
 
 load_dotenv(override=True)
 
@@ -388,6 +389,8 @@ def run_audience(
                 "country":      company.get("hq_country"),
                 "employee_range": company.get("employee_range"),
                 "naics_code":   _first_naics(company.get("naics")),
+                "grizz_activity": company.get("grizz_activity"),
+                "revenue_range": company.get("revenue_range"),
                 "erp_tech_stack":    company.get("erp_tech_stack"),
                 "erp_match_type":    company.get("erp_match_type"),
                 "erp_keyword_usage": company.get("erp_keyword_usage"),
@@ -455,6 +458,8 @@ def run_audience(
                     "country":      company.get("hq_country"),
                     "employee_range": company.get("employee_range"),
                     "naics_code":   _first_naics(company.get("naics")),
+                    "grizz_activity": company.get("grizz_activity"),
+                    "revenue_range": company.get("revenue_range"),
                     "erp_tech_stack":    company.get("erp_tech_stack"),
                     "erp_match_type":     company.get("erp_match_type"),
                     "erp_keyword_usage": company.get("erp_keyword_usage"),
@@ -464,10 +469,16 @@ def run_audience(
                     "other_tech_signals": company.get("other_tech_signals"),
                 }
                 mapped = apply_mapping(grizz_data, field_mapping)
-                if company.get("company_name"):
-                    mapped.setdefault("Name", company["company_name"])
-                if company.get("domain"):
-                    mapped.setdefault("Website", f"https://{company['domain']}")
+                if crm == "salesforce":
+                    if company.get("company_name"):
+                        mapped.setdefault("Name", company["company_name"])
+                    if company.get("domain"):
+                        mapped.setdefault("Website", f"https://{company['domain']}")
+                elif crm == "hubspot":
+                    if company.get("company_name"):
+                        mapped.setdefault("name", company["company_name"])
+                    if company.get("domain"):
+                        mapped.setdefault("domain", company["domain"])
                 records_to_create.append(mapped)
 
             if dry_run:
@@ -549,10 +560,13 @@ def setup(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without creating fields"),
 ):
     """Create all recommended Grizz custom fields in your CRM."""
-    if crm != "salesforce":
+    if crm == "salesforce":
+        run_setup_salesforce(dry_run=dry_run)
+    elif crm == "hubspot":
+        run_setup_hubspot(dry_run=dry_run)
+    else:
         console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
         raise typer.Exit(1)
-    run_setup(dry_run=dry_run)
 
 
 @app.callback(invoke_without_command=True)
@@ -565,10 +579,10 @@ def main(ctx: typer.Context) -> None:
     action = questionary.select(
         "What would you like to do?",
         choices=[
-            "Set up Salesforce fields",
+            "Set up CRM fields",
             "Enrich accounts from CSV",
             "Run audience → push to CRM",
-            questionary.Choice("Create Salesforce campaign  (coming soon)", disabled="coming soon"),
+            questionary.Choice("Create CRM campaign  (coming soon)", disabled="coming soon"),
             "Exit",
         ],
     ).ask()
@@ -576,13 +590,25 @@ def main(ctx: typer.Context) -> None:
     if not action or action == "Exit":
         raise typer.Exit(0)
 
-    if action == "Set up Salesforce fields":
+    if action == "Set up CRM fields":
+        crm = questionary.select(
+            "Select your CRM:",
+            choices=list(ADAPTERS.keys()),
+        ).ask()
+        if not crm:
+            raise typer.Exit(0)
+
         dry_run = questionary.confirm(
             "Dry run (preview without creating fields)?",
             default=False,
         ).ask()
         console.print()
-        run_setup(dry_run=bool(dry_run))
+        if crm == "salesforce":
+            run_setup_salesforce(dry_run=bool(dry_run))
+        elif crm == "hubspot":
+            run_setup_hubspot(dry_run=bool(dry_run))
+        else:
+            console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
         return
 
     if action == "Enrich accounts from CSV":

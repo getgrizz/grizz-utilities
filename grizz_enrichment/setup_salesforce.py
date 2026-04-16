@@ -65,8 +65,16 @@ GRIZZ_FIELDS = [
         "Metadata": {"type": "Text", "label": "Grizz Employee Range", "length": 50, "required": False},
     },
     {
+        "FullName": "Account.Grizz_Revenue_Range__c",
+        "Metadata": {"type": "Text", "label": "Grizz Revenue Range", "length": 50, "required": False},
+    },
+    {
         "FullName": "Account.Grizz_NAICS__c",
         "Metadata": {"type": "Text", "label": "Grizz NAICS", "length": 10, "required": False},
+    },
+    {
+        "FullName": "Account.Grizz_Activity__c",
+        "Metadata": {"type": "Text", "label": "Grizz Activity", "length": 255, "required": False},
     },
 
     # ── ERP Intelligence ───────────────────────────────────────────────────────
