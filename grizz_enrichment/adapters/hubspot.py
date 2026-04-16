@@ -155,7 +155,7 @@ class HubSpotAdapter(CRMAdapter):
         results: list[dict] = []
         for i in range(0, len(payload), _WRITE_BATCH):
             if i > 0:
-                time.sleep(0.5)
+                time.sleep(1.0)
             resp = self._session.post(
                 f"{_BASE_URL}/crm/v3/objects/companies/batch/update",
                 json={"inputs": payload[i:i + _WRITE_BATCH]},
@@ -176,7 +176,7 @@ class HubSpotAdapter(CRMAdapter):
         results: list[dict] = []
         for i in range(0, len(payload), _WRITE_BATCH):
             if i > 0:
-                time.sleep(0.5)
+                time.sleep(1.0)
             resp = self._session.post(
                 f"{_BASE_URL}/crm/v3/objects/companies/batch/create",
                 json={"inputs": payload[i:i + _WRITE_BATCH]},
