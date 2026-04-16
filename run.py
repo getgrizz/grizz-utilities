@@ -246,7 +246,7 @@ def _save_audience_csv(audience_id: str, companies: list[dict]) -> Path:
     out_dir = Path("csv_out")
     out_dir.mkdir(exist_ok=True)
     out_path = out_dir / f"Audience {audience_id}.csv"
-    with open(out_path, "w", newline="") as f:
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_AUDIENCE_CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(companies)

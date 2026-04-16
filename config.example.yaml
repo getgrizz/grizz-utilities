@@ -1,13 +1,12 @@
 # Grizz CRM Enrichment — Field Mapping Configuration
 #
-# Copy this file to config.yaml and edit to match your Salesforce field API names.
-# Each entry maps a Grizz field (left) to your Salesforce field API name (right).
+# Copy this file to config.yaml and fill in the section for your CRM.
+# Each entry maps a Grizz field (left) to your CRM's field/property name (right).
 #
 # Field naming conventions and setup instructions:
 #   https://getgrizz.com/docs/crm-fields/
 #
-# All Grizz_ custom fields must be created in Salesforce before running:
-#   Setup > Object Manager > Account > Fields & Relationships > New
+# Run `python run.py setup --crm <crm>` to create all Grizz custom fields first.
 #
 # Remove any lines you don't want to sync.
 

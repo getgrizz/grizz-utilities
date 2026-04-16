@@ -35,14 +35,31 @@ Enrich your CRM account records with Grizz construction company data — firmogr
 
 ## Setup
 
-**1. Clone the repo**
+**1. Install Python**
+
+If you're not sure whether Python is installed, open a terminal and run:
+
+```bash
+python3 --version
+```
+
+If you see a version number (e.g. `Python 3.11.4`), you're good — skip to step 2.
+
+If not:
+
+- **Mac:** Download and run the installer from [python.org/downloads](https://www.python.org/downloads/). After installing, close and reopen your terminal.
+- **Windows:** Download and run the installer from [python.org/downloads](https://www.python.org/downloads/). On the first screen of the installer, **check the box that says "Add Python to PATH"** before clicking Install.
+
+Any version 3.9 or higher will work.
+
+**2. Clone the repo**
 
 ```bash
 git clone https://github.com/getgrizz/grizz-utilities.git
 cd grizz-utilities
 ```
 
-**2. Create and activate a virtual environment**
+**3. Create and activate a virtual environment**
 
 A virtual environment keeps this tool's dependencies isolated from the rest of your system. You only need to do this once.
 
@@ -60,13 +77,13 @@ python -m venv .venv
 
 You'll see `(.venv)` appear at the start of your terminal prompt when it's active. You'll need to run the activate command each time you open a new terminal window before using the tool.
 
-**3. Install dependencies**
+**4. Install dependencies**
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**4. Configure credentials**
+**5. Configure credentials**
 
 ```bash
 cp .env.example .env
@@ -74,7 +91,7 @@ cp .env.example .env
 
 Open `.env` and fill in your Grizz API key and the credentials for your CRM. See [Salesforce API credentials](#salesforce-api-credentials) or [HubSpot API credentials](#hubspot-api-credentials) below for step-by-step instructions.
 
-**5. Configure field mappings**
+**6. Configure field mappings**
 
 ```bash
 cp config.example.yaml config.yaml
