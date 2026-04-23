@@ -60,7 +60,7 @@ class SalesforceAdapter(CRMAdapter):
         """Patch the Salesforce Account with the provided fields."""
         self.sf.Account.update(account_id, fields)
 
-    def find_accounts_bulk(self, companies: list[dict]) -> dict[str, str]:
+    def find_accounts_bulk(self, companies: list[dict], grizz_id_field: str) -> dict[str, str]:
         """Match companies to Salesforce Accounts in bulk using IN queries.
 
         Queries in batches of 200 to stay within SOQL limits.
@@ -73,13 +73,13 @@ class SalesforceAdapter(CRMAdapter):
         grizz_ids = [str(c["grizz_id"]) for c in companies if c.get("grizz_id")]
         domains   = [c["domain"] for c in companies if c.get("domain")]
 
-        # Match by Grizz_Company_ID__c
+        # Match by grizz_id_field from config
         for i in range(0, len(grizz_ids), BATCH):
             batch = grizz_ids[i:i + BATCH]
             values = ", ".join(f"'{v}'" for v in batch)
-            soql = f"SELECT Id, Grizz_Company_ID__c FROM Account WHERE Grizz_Company_ID__c IN ({values})"
+            soql = f"SELECT Id, {grizz_id_field} FROM Account WHERE {grizz_id_field} IN ({values})"
             for record in self.sf.query_all(soql).get("records", []):
-                matched[record["Grizz_Company_ID__c"]] = record["Id"]
+                matched[record[grizz_id_field]] = record["Id"]
 
         # Match remaining unmatched companies by domain
         matched_grizz_ids = set(matched.keys())

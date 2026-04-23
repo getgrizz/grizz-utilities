@@ -95,7 +95,7 @@ class HubSpotAdapter(CRMAdapter):
 
         return None
 
-    def find_accounts_bulk(self, companies: list[dict]) -> dict[str, str]:
+    def find_accounts_bulk(self, companies: list[dict], grizz_id_field: str) -> dict[str, str]:
         """Match companies to HubSpot companies in bulk using search.
 
         Queries in batches of 50 to stay within the IN filter limit.
@@ -109,15 +109,15 @@ class HubSpotAdapter(CRMAdapter):
         grizz_ids = [str(c["grizz_id"]) for c in companies if c.get("grizz_id")]
         domains   = [c["domain"] for c in companies if c.get("domain")]
 
-        # Match by grizz_company_id
+        # Match by grizz_id_field from config
         for i in range(0, len(grizz_ids), _SEARCH_BATCH):
             batch = grizz_ids[i:i + _SEARCH_BATCH]
             results = self._search(
-                {"propertyName": "grizz_company_id", "operator": "IN", "values": batch},
-                properties=["grizz_company_id"],
+                {"propertyName": grizz_id_field, "operator": "IN", "values": batch},
+                properties=[grizz_id_field],
             )
             for record in results:
-                gid = (record.get("properties") or {}).get("grizz_company_id")
+                gid = (record.get("properties") or {}).get(grizz_id_field)
                 if gid:
                     matched[gid] = record["id"]
             time.sleep(0.25)  # respect 4 req/s Search API limit

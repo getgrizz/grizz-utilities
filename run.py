@@ -347,7 +347,7 @@ def run_audience(
 
     console.print(f"Matching {len(companies)} companies to existing accounts...")
     try:
-        match_map = adapter.find_accounts_bulk(companies)
+        match_map = adapter.find_accounts_bulk(companies, field_mapping["grizz_id"])
     except Exception as e:
         console.print(f"  [red]Bulk lookup failed: {e}[/red]")
         match_map = {}

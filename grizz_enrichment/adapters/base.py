@@ -22,10 +22,11 @@ class CRMAdapter(ABC):
         """Return the CRM account ID matching domain or grizz_id, or None."""
 
     @abstractmethod
-    def find_accounts_bulk(self, companies: list[dict]) -> dict[str, str]:
+    def find_accounts_bulk(self, companies: list[dict], grizz_id_field: str) -> dict[str, str]:
         """Match a list of company dicts to existing CRM accounts in bulk.
 
         Each dict should have 'grizz_id' and/or 'domain' keys.
+        grizz_id_field is the CRM field name used to store the Grizz company ID.
         Returns a dict mapping grizz_id (or domain as fallback) → CRM account ID
         for every company that was matched.
         """
