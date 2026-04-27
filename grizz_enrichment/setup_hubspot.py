@@ -24,6 +24,14 @@ GRIZZ_PROPERTIES = [
         "hasUniqueValue": True,
     },
     {
+        "name":        "grizz_gid",
+        "label":       "Grizz GID",
+        "type":        "string",
+        "fieldType":   "text",
+        "groupName":   "grizz",
+        "description": "Grizz canonical company identifier (GC + sha256 of domain). Stable cross-system key.",
+    },
+    {
         "name":      "grizz_company_name",
         "label":     "Grizz Company Name",
         "type":      "string",

@@ -17,6 +17,7 @@ salesforce:
 
     # ── Company Identity ───────────────────────────────────────────────────────
     grizz_id:           Grizz_Company_ID__c
+    gid_company:        Grizz_GID__c
     grizz_url:          Grizz_URL__c
     company_name:       Grizz_Company_Name__c
     domain:             Grizz_Domain__c
@@ -60,6 +61,7 @@ hubspot:
 
     # ── Company Identity ───────────────────────────────────────────────────────
     grizz_id:              grizz_company_id
+    gid_company:           grizz_gid
     grizz_url:             grizz_url
     company_name:          grizz_company_name
     domain:                grizz_domain

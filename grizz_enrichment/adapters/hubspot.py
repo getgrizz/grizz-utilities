@@ -154,14 +154,10 @@ class HubSpotAdapter(CRMAdapter):
         ]
         results: list[dict] = []
         for i in range(0, len(payload), _WRITE_BATCH):
-            if i > 0:
-                time.sleep(1.0)
-            resp = self._session.post(
+            resp = self._post_with_retry(
                 f"{_BASE_URL}/crm/v3/objects/companies/batch/update",
-                json={"inputs": payload[i:i + _WRITE_BATCH]},
-                timeout=30,
+                {"inputs": payload[i:i + _WRITE_BATCH]},
             )
-            resp.raise_for_status()
             for item in resp.json().get("results", []):
                 results.append({"id": item["id"], "success": True, "errors": []})
         return results
@@ -175,17 +171,27 @@ class HubSpotAdapter(CRMAdapter):
         payload = [{"properties": r} for r in records]
         results: list[dict] = []
         for i in range(0, len(payload), _WRITE_BATCH):
-            if i > 0:
-                time.sleep(1.0)
-            resp = self._session.post(
+            resp = self._post_with_retry(
                 f"{_BASE_URL}/crm/v3/objects/companies/batch/create",
-                json={"inputs": payload[i:i + _WRITE_BATCH]},
-                timeout=30,
+                {"inputs": payload[i:i + _WRITE_BATCH]},
             )
-            resp.raise_for_status()
             for item in resp.json().get("results", []):
                 results.append({"id": item["id"], "success": True, "errors": []})
         return results
+
+    def _post_with_retry(self, url: str, body: dict, max_retries: int = 4) -> requests.Response:
+        """POST with automatic 429 retry, respecting the Retry-After header."""
+        for attempt in range(max_retries + 1):
+            resp = self._session.post(url, json=body, timeout=30)
+            if resp.status_code == 429 and attempt < max_retries:
+                wait = int(resp.headers.get("Retry-After", "10"))
+                print(f"\n  Rate limited — waiting {wait}s before retry {attempt + 1}/{max_retries}...", end=" ", flush=True)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        resp.raise_for_status()  # unreachable, satisfies type checkers
+        return resp
 
     def _search(self, filter_: dict, properties: list[str]) -> list[dict]:
         """Execute a single-filter company search and return all results."""

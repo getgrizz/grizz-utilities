@@ -222,8 +222,80 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool) -> 
 
 # ── Audience → CRM logic ───────────────────────────────────────────────────────
 
+def _run_update_batches(
+    adapter,
+    records: list[dict],
+    batch_size: int,
+    console: Console,
+) -> tuple[int, list[dict]]:
+    """Send records to the CRM in batches. Returns (updated_count, failed_records).
+
+    On completion, if any batches failed the user is prompted to retry once.
+    """
+    updated = 0
+    failed_records: list[dict] = []
+    total = len(records)
+
+    for batch_start in range(0, total, batch_size):
+        batch = records[batch_start:batch_start + batch_size]
+        batch_end = min(batch_start + batch_size, total)
+        console.print(f"  Updating records {batch_start + 1}–{batch_end} of {total}...", end=" ")
+        try:
+            results = adapter.update_accounts(batch)
+            batch_ok = sum(1 for r in results if r.get("success"))
+            batch_fail = len(results) - batch_ok
+            updated += batch_ok
+            if batch_fail:
+                console.print(f"[green]{batch_ok} updated[/green], [red]{batch_fail} failed.[/red]")
+                for r in results:
+                    if not r.get("success"):
+                        console.print(f"    [red]{r.get('errors')}[/red]")
+                failed_records.extend(batch)
+            else:
+                console.print(f"[green]{batch_ok} updated.[/green]")
+        except Exception as e:
+            console.print(f"[red]batch failed: {e}[/red]")
+            failed_records.extend(batch)
+
+    if failed_records:
+        console.print(
+            f"\n  [yellow]{len(failed_records)} record(s) failed.[/yellow] "
+            f"This is usually a temporary rate-limit issue."
+        )
+        retry = questionary.confirm(
+            f"Retry the {len(failed_records)} failed record(s) now?",
+            default=True,
+        ).ask()
+        if retry:
+            console.print(f"  Retrying {len(failed_records)} record(s)...")
+            retry_updated = 0
+            still_failed: list[dict] = []
+            retry_total = len(failed_records)
+            for batch_start in range(0, retry_total, batch_size):
+                batch = failed_records[batch_start:batch_start + batch_size]
+                batch_end = min(batch_start + batch_size, retry_total)
+                console.print(f"  Retrying records {batch_start + 1}–{batch_end} of {retry_total}...", end=" ")
+                try:
+                    results = adapter.update_accounts(batch)
+                    batch_ok = sum(1 for r in results if r.get("success"))
+                    retry_updated += batch_ok
+                    if batch_ok < len(batch):
+                        console.print(f"[green]{batch_ok} updated[/green], [red]{len(batch) - batch_ok} still failed.[/red]")
+                        still_failed.extend(batch)
+                    else:
+                        console.print(f"[green]{batch_ok} updated.[/green]")
+                except Exception as e:
+                    console.print(f"[red]retry batch failed: {e}[/red]")
+                    still_failed.extend(batch)
+            updated += retry_updated
+            if still_failed:
+                console.print(f"  [red]{len(still_failed)} record(s) could not be updated after retry.[/red]")
+            failed_records = still_failed
+
+    return updated, failed_records
+
 _AUDIENCE_CSV_COLUMNS = [
-    "grizz_id", "grizz_url", "company_name", "domain", "linkedin_url",
+    "grizz_id", "gid_company", "grizz_url", "company_name", "domain", "linkedin_url",
     "phone", "email",
     "hq_city", "hq_region", "hq_country",
     "employee_range", "revenue_range",
@@ -378,6 +450,7 @@ def run_audience(
             grizz_id = company.get("grizz_id") or company.get("company_id")
             grizz_data = {
                 "grizz_id":    grizz_id,
+                "gid_company": company.get("gid_company"),
                 "grizz_url":   company.get("grizz_url") or (f"https://getgrizz.com/company/{grizz_id}" if grizz_id else None),
                 "company_name": company.get("company_name"),
                 "domain":       company.get("domain"),
@@ -408,25 +481,9 @@ def run_audience(
             for r in records_to_update:
                 console.print(f"  [dim]{r['Id']}: would update {[k for k in r if k != 'Id']}[/dim]")
         else:
-            total = len(records_to_update)
-            for batch_start in range(0, total, batch_size):
-                batch = records_to_update[batch_start:batch_start + batch_size]
-                batch_end = min(batch_start + batch_size, total)
-                console.print(f"  Updating records {batch_start + 1}–{batch_end} of {total}...", end=" ")
-                try:
-                    results = adapter.update_accounts(batch)
-                    batch_ok = sum(1 for r in results if r.get("success"))
-                    batch_fail = len(results) - batch_ok
-                    updated += batch_ok
-                    if batch_fail:
-                        console.print(f"[green]{batch_ok} updated[/green], [red]{batch_fail} failed.[/red]")
-                        for r in results:
-                            if not r.get("success"):
-                                console.print(f"    [red]{r.get('errors')}[/red]")
-                    else:
-                        console.print(f"[green]{batch_ok} updated.[/green]")
-                except Exception as e:
-                    console.print(f"[red]batch failed: {e}[/red]")
+            updated, records_to_update = _run_update_batches(
+                adapter, records_to_update, batch_size, console
+            )
         console.print()
 
     # ── Prompt to create unmatched accounts ─────────────────────────────────
@@ -447,6 +504,7 @@ def run_audience(
                 grizz_id = company.get("grizz_id") or company.get("company_id")
                 grizz_data = {
                     "grizz_id":    grizz_id,
+                    "gid_company": company.get("gid_company"),
                     "grizz_url":   f"https://getgrizz.com/company/{grizz_id}" if grizz_id else None,
                     "company_name": company.get("company_name"),
                     "domain":       company.get("domain"),

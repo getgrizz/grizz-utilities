@@ -17,6 +17,10 @@ GRIZZ_FIELDS = [
         "Metadata": {"type": "Text", "label": "Grizz Company ID", "length": 255, "externalId": True, "required": False},
     },
     {
+        "FullName": "Account.Grizz_GID__c",
+        "Metadata": {"type": "Text", "label": "Grizz GID", "length": 14, "required": False},
+    },
+    {
         "FullName": "Account.Grizz_Company_Name__c",
         "Metadata": {"type": "Text", "label": "Grizz Company Name", "length": 255, "required": False},
     },
