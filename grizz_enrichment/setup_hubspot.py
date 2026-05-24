@@ -188,6 +188,18 @@ GRIZZ_PROPERTIES = [
         "fieldType": "textarea",
         "groupName": "grizz",
     },
+
+    # ── Sync timestamp ─────────────────────────────────────────────────────────
+    # Written by every Grizz CRM-sync operation.  Customers + Grizz's
+    # dashboard use this to distinguish "never touched" from "Grizz looked
+    # and had nothing to add" from "data is stale; time to refresh."
+    {
+        "name":      "grizz_last_sync",
+        "label":     "Grizz Last Sync",
+        "type":      "datetime",
+        "fieldType": "date",
+        "groupName": "grizz",
+    },
 ]
 
 _GROUP_NAME  = "grizz"

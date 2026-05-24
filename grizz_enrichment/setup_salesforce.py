@@ -114,6 +114,17 @@ GRIZZ_FIELDS = [
         "FullName": "Account.Grizz_Other_Tech_Signals__c",
         "Metadata": {"type": "LongTextArea", "label": "Grizz Other Tech Signals", "length": 32768, "visibleLines": 4},
     },
+
+    # ── Sync timestamp ─────────────────────────────────────────────────────────
+    # Set by every Grizz CRM-sync operation, regardless of whether other
+    # Grizz fields had values to push.  Customers (and Grizz's dashboard)
+    # use this to distinguish "Grizz has never touched this account" from
+    # "Grizz looked but had nothing to add" from "Grizz data is stale and
+    # needs a refresh."
+    {
+        "FullName": "Account.Grizz_Last_Sync__c",
+        "Metadata": {"type": "DateTime", "label": "Grizz Last Sync"},
+    },
 ]
 
 
