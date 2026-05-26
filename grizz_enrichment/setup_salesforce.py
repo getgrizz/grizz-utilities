@@ -330,8 +330,20 @@ def _add_layout_section(sf, dry_run: bool = False) -> None:
         console.print(f"[yellow]skipped ({e})[/yellow]")
 
 
-def run_setup(dry_run: bool = False) -> None:
-    """Connect to Salesforce and create all Grizz custom fields on Account."""
+def run_setup(dry_run: bool = False) -> dict:
+    """Connect to Salesforce and create all Grizz custom fields on Account.
+
+    Returns a structured summary so callers (MCP, scripts) can tell the user
+    exactly what changed instead of a generic "complete" message:
+
+        {
+          "created":   ["Grizz_Last_Sync__c", ...],   # newly created this run
+          "existed":   ["Grizz_Company_ID__c", ...],  # already in CRM, skipped
+          "errors":    [{"field": "...", "error": "..."}],
+          "dry_run":   bool,
+        }
+    """
+    empty: dict = {"created": [], "existed": [], "errors": [], "dry_run": dry_run}
 
     # ── Connect ──────────────────────────────────────────────────────────────
     console.print("Connecting to Salesforce...", end=" ")
@@ -350,10 +362,10 @@ def run_setup(dry_run: bool = False) -> None:
             )
     except KeyError as e:
         console.print(f"\n[red]Missing environment variable: {e}[/red]")
-        return
+        return {**empty, "errors": [{"field": "", "error": f"missing env var {e}"}]}
     except Exception as e:
         console.print(f"\n[red]Connection failed: {e}[/red]")
-        return
+        return {**empty, "errors": [{"field": "", "error": f"connection failed: {e}"}]}
     console.print("[green]connected.[/green]")
 
     if dry_run:
@@ -440,3 +452,10 @@ def run_setup(dry_run: bool = False) -> None:
         "Setup → Object Manager → Account → Lightning Record Pages, "
         "edit your Account page, and drag the Grizz fields into a new section.[/dim]"
     )
+
+    return {
+        "created":   [api for _, api, o, _ in results if o == "created"],
+        "existed":   [api for _, api, o, _ in results if o == "exists"],
+        "errors":    [{"field": api, "error": d} for _, api, o, d in results if o == "error"],
+        "dry_run":   dry_run,
+    }

@@ -220,15 +220,27 @@ def _ensure_property_group(session: requests.Session) -> None:
     resp.raise_for_status()
 
 
-def run_setup(dry_run: bool = False) -> None:
-    """Connect to HubSpot and create all Grizz custom properties on Company records."""
+def run_setup(dry_run: bool = False) -> dict:
+    """Connect to HubSpot and create all Grizz custom properties on Company records.
+
+    Returns a structured summary so callers (MCP, scripts) can tell the user
+    exactly what changed instead of a generic "complete" message:
+
+        {
+          "created":   ["grizz_last_sync", ...],   # newly created this run
+          "existed":   ["grizz_company_id", ...],  # already in CRM, skipped
+          "errors":    [{"field": "...", "error": "..."}],
+          "dry_run":   bool,
+        }
+    """
+    empty: dict = {"created": [], "existed": [], "errors": [], "dry_run": dry_run}
 
     # ── Connect ──────────────────────────────────────────────────────────────
     console.print("Connecting to HubSpot...", end=" ")
     token = os.environ.get("HUBSPOT_API_KEY")
     if not token:
         console.print("\n[red]HUBSPOT_API_KEY is not set.[/red]")
-        return
+        return {**empty, "errors": [{"field": "", "error": "HUBSPOT_API_KEY not set"}]}
 
     session = requests.Session()
     session.headers.update({
@@ -239,12 +251,12 @@ def run_setup(dry_run: bool = False) -> None:
     resp = session.get(f"{_BASE_URL}/crm/v3/objects/companies", params={"limit": 1}, timeout=10)
     if resp.status_code == 401:
         console.print("\n[red]HUBSPOT_API_KEY is invalid or lacks required scopes.[/red]")
-        return
+        return {**empty, "errors": [{"field": "", "error": "auth failed (401)"}]}
     try:
         resp.raise_for_status()
     except Exception as e:
         console.print(f"\n[red]Connection failed: {e}[/red]")
-        return
+        return {**empty, "errors": [{"field": "", "error": f"connection failed: {e}"}]}
     console.print("[green]connected.[/green]")
 
     if dry_run:
@@ -316,6 +328,13 @@ def run_setup(dry_run: bool = False) -> None:
         if existed: parts.append(f"{existed} already existed")
         if errors:  parts.append(f"[red]{errors} failed[/red]")
         console.print(f"\n[bold]Done:[/bold] {', '.join(parts)}.")
+
+    return {
+        "created":   [api for _, api, o, _ in results if o == "created"],
+        "existed":   [api for _, api, o, _ in results if o == "exists"],
+        "errors":    [{"field": api, "error": d} for _, api, o, d in results if o == "error"],
+        "dry_run":   dry_run,
+    }
 
     console.print(
         "\n[dim]Note: properties have been created in the 'Grizz' group but won't appear "
