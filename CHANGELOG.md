@@ -7,6 +7,32 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.0] — 2026-05-27
+
+### Added
+- `grizz_client.enrich()` accepts the full canonical cascade input
+  (`gid_company`, `grizz_id`, `domain`, `company_name`, `hq_city`,
+  `hq_state`, `hq_country`, `hq_phone`).  `domain` may still be passed
+  positionally.
+- `grizz_client.submit_bulk()` and `grizz_client.enrich_bulk()` —
+  submit up to 200 companies in one round-trip via
+  `POST /api/v1/enrichment/bulk/`.  Soft-caps to org monthly budget.
+- `grizz_client.get_budget()` — wraps `GET /api/v1/enrichment/budget/`.
+- Each entry in `enrich_bulk()`'s `matched` / `no_match` / `low_conf` /
+  `failed` lists now carries the original `input` dict so callers can
+  correlate results to inputs.
+
+### Changed
+- **BREAKING — MCP `field_mapping` canonical key rename**: the legacy
+  key `grizz_id` (mapping to the `Grizz_Company_ID__c` /
+  `grizz_company_id` CRM column) has been hard-cut renamed to
+  `gid_company`.  Customers using the
+  `x-salesforce-field-mapping` / `x-hubspot-field-mapping` headers to
+  override field mappings must update their override JSON to use
+  `gid_company`.  The CRM column itself is unchanged.
+
+---
+
 ## [0.2.0] — 2026-04-16
 
 ### Added

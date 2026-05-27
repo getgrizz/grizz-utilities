@@ -171,12 +171,14 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
     """Submit a batch of companies and fetch every completed result.
 
     Submits via POST /api/v1/enrichment/bulk/, polls each PENDING request
-    until COMPLETE/FAILED, then fetches results.  Returns:
+    until COMPLETE/FAILED, then fetches results.  Each matched/no_match/
+    low_conf/failed entry carries its `input` dict so callers can map
+    results back to the input cohort.
 
         {
-          "matched":     [company_dict, ...],   # FOUND_IN_DB or ENRICHED
-          "no_match":    [{"input": {...}, "request_id": "..."}, ...],
-          "low_conf":    [{"input": {...}, "request_id": "..."}, ...],
+          "matched":     [{"input": {...}, "company": {...}, "request_id": "..."}],
+          "no_match":    [{"input": {...}, "request_id": "..."}],
+          "low_conf":    [{"input": {...}, "request_id": "..."}],
           "failed":      [{"input": {...}, "request_id": "...", "error": "..."}],
           "rejected":    [...],                 # passed through from bulk endpoint
           "budget":      {budget snapshot from bulk endpoint},
@@ -193,14 +195,10 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
     low_conf: list[dict] = []
     failed: list[dict]   = []
 
-    for req in initial_requests:
-        request_id  = req.get("id")
-        input_dict  = {
-            "gid_company":  req.get("input_grizz_id"),  # legacy DB column
-            "domain":       req.get("input_domain"),
-            "company_name": req.get("input_company_name"),
-        }
-        # Poll until terminal.
+    # Align each returned EnrichmentRequest with its original input dict
+    # by position — the bulk endpoint preserves order for `results`.
+    for raw_input, req in zip(companies, initial_requests):
+        request_id = req.get("id")
         st = req.get("status")
         polls = 0
         while st not in ("COMPLETE", "FAILED") and polls < MAX_POLLS:
@@ -210,29 +208,30 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
             st = req.get("status")
 
         if st == "FAILED":
-            failed.append({"input": input_dict, "request_id": request_id,
+            failed.append({"input": raw_input, "request_id": request_id,
                            "error": req.get("error_detail", "")})
             continue
         if st != "COMPLETE":
-            failed.append({"input": input_dict, "request_id": request_id,
+            failed.append({"input": raw_input, "request_id": request_id,
                            "error": f"timeout after {polls} polls"})
             continue
 
         if req.get("result_type") == "NOT_FOUND":
-            no_match.append({"input": input_dict, "request_id": request_id})
+            no_match.append({"input": raw_input, "request_id": request_id})
             continue
         if req.get("result_type") == "LOW_CONF":
-            low_conf.append({"input": input_dict, "request_id": request_id})
+            low_conf.append({"input": raw_input, "request_id": request_id})
             continue
 
         results = fetch_results(api_key, request_id)
         if results.get("source") == "no_match":
-            no_match.append({"input": input_dict, "request_id": request_id})
+            no_match.append({"input": raw_input, "request_id": request_id})
             continue
         company = results.get("company") or {}
         if results.get("source") == "database" and company:
             company = _normalize_database_fields(company)
-        matched.append(company)
+        matched.append({"input": raw_input, "company": company,
+                        "request_id": request_id})
 
     return {
         "matched":  matched,
