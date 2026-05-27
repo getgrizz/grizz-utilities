@@ -16,10 +16,81 @@ def _headers(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
-def submit(api_key: str, domain: str) -> dict:
-    """Submit an enrichment request. Returns the request object (includes id and status)."""
+# Canonical cascade-input keys (see the Grizz API docs §10).  submit() and
+# submit_bulk() only forward keys present in this set, so callers can pass
+# entire CRM-derived dicts without scrubbing extras.
+_CASCADE_INPUT_KEYS = frozenset({
+    "gid_company", "grizz_id", "domain",
+    "company_name", "hq_city", "hq_state", "hq_country", "hq_phone",
+})
+
+
+def _cascade_payload(company: dict) -> dict:
+    """Pull only the cascade-input keys out of `company`, dropping empties."""
+    return {k: company[k] for k in _CASCADE_INPUT_KEYS if company.get(k)}
+
+
+def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
+    """Submit a single enrichment request.
+
+    Pass any of the cascade-input fields (see the Grizz API docs §10):
+        gid_company, grizz_id, domain, company_name,
+        hq_city, hq_state, hq_country, hq_phone
+
+    `domain` may still be passed positionally for backward compatibility.
+    """
+    payload = _cascade_payload({**kwargs, **({"domain": domain} if domain else {})})
+    if not payload:
+        raise ValueError("submit() requires at least one cascade-input field.")
     url = f"{BASE_URL}/api/v1/enrichment/"
-    resp = requests.post(url, json={"domain": domain}, headers=_headers(api_key), timeout=30)
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def submit_bulk(api_key: str, companies: list[dict]) -> dict:
+    """Submit up to 200 companies in one POST.
+
+    Each entry may carry any of the cascade-input keys
+    (gid_company, grizz_id, domain, company_name, hq_city, hq_state,
+    hq_country, hq_phone).  Server enforces the soft-cap to the org's
+    remaining monthly budget — see the Grizz API docs §10 + the /enrichment/bulk/
+    endpoint docs.  Returns the bulk response body verbatim:
+
+        {
+          "submitted":     N,
+          "rejected":      [...],
+          "results":       [EnrichmentRequest...],
+          "budget_remaining_at_start": int | null,
+          "budget_consumed":            int,
+          "budget_remaining":           int | null,
+          "budget_capped":              bool,
+          "budget_resets_at":           iso8601
+        }
+    """
+    payload = {"companies": [_cascade_payload(c) for c in companies]}
+    url = f"{BASE_URL}/api/v1/enrichment/bulk/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
+    # 207 (multi-status) and 429 (budget-capped) are both valid responses
+    # carrying full body content — don't raise on them.
+    if resp.status_code not in (200, 201, 207, 429):
+        resp.raise_for_status()
+    return resp.json()
+
+
+def get_budget(api_key: str) -> dict:
+    """Snapshot the org's monthly enrichment-call budget.
+
+        {
+          "monthly_limit": int | null,   # null = unlimited
+          "used":          int,
+          "remaining":     int | null,
+          "month":         "YYYY-MM",
+          "resets_at":     iso8601
+        }
+    """
+    url = f"{BASE_URL}/api/v1/enrichment/budget/"
+    resp = requests.get(url, headers=_headers(api_key), timeout=15)
     resp.raise_for_status()
     return resp.json()
 
@@ -40,13 +111,15 @@ def fetch_results(api_key: str, request_id: str) -> dict:
     return resp.json()
 
 
-def enrich(api_key: str, domain: str, on_status=None) -> dict | None:
-    """Run the full submit → poll → fetch cycle for a single domain.
+def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) -> dict | None:
+    """Run the full submit → poll → fetch cycle for a single company.
 
-    Args:
-        api_key:   Grizz API key.
-        domain:    Domain to enrich (e.g. "acme.com").
-        on_status: Optional callable(status: str) invoked on each poll tick.
+    Accepts any of the cascade-input keys (see the Grizz API docs §10):
+        gid_company, grizz_id, domain, company_name,
+        hq_city, hq_state, hq_country, hq_phone
+
+    `domain` may still be passed positionally; pure-domain callers are
+    unchanged.
 
     Returns:
         Results dict on success, None if Grizz returns no_match.
@@ -56,7 +129,7 @@ def enrich(api_key: str, domain: str, on_status=None) -> dict | None:
         TimeoutError:  If polling exceeds MAX_POLLS.
         requests.HTTPError: On API errors.
     """
-    data = submit(api_key, domain)
+    data = submit(api_key, domain=domain, **kwargs)
     request_id = data["id"]
     status = data["status"]
 
@@ -92,6 +165,89 @@ def enrich(api_key: str, domain: str, on_status=None) -> dict | None:
         company = _normalize_database_fields(company)
 
     return company
+
+
+def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
+    """Submit a batch of companies and fetch every completed result.
+
+    Submits via POST /api/v1/enrichment/bulk/, polls each PENDING request
+    until COMPLETE/FAILED, then fetches results.  Returns:
+
+        {
+          "matched":     [company_dict, ...],   # FOUND_IN_DB or ENRICHED
+          "no_match":    [{"input": {...}, "request_id": "..."}, ...],
+          "low_conf":    [{"input": {...}, "request_id": "..."}, ...],
+          "failed":      [{"input": {...}, "request_id": "...", "error": "..."}],
+          "rejected":    [...],                 # passed through from bulk endpoint
+          "budget":      {budget snapshot from bulk endpoint},
+        }
+
+    NOTE: companies that fall through to async scrape are polled here.
+    For larger batches the wall-clock time scales with the slowest scrape.
+    """
+    body = submit_bulk(api_key, companies)
+    initial_requests = body.get("results") or []
+
+    matched: list[dict]  = []
+    no_match: list[dict] = []
+    low_conf: list[dict] = []
+    failed: list[dict]   = []
+
+    for req in initial_requests:
+        request_id  = req.get("id")
+        input_dict  = {
+            "gid_company":  req.get("input_grizz_id"),  # legacy DB column
+            "domain":       req.get("input_domain"),
+            "company_name": req.get("input_company_name"),
+        }
+        # Poll until terminal.
+        st = req.get("status")
+        polls = 0
+        while st not in ("COMPLETE", "FAILED") and polls < MAX_POLLS:
+            time.sleep(POLL_INTERVAL)
+            polls += 1
+            req = poll_status(api_key, request_id)
+            st = req.get("status")
+
+        if st == "FAILED":
+            failed.append({"input": input_dict, "request_id": request_id,
+                           "error": req.get("error_detail", "")})
+            continue
+        if st != "COMPLETE":
+            failed.append({"input": input_dict, "request_id": request_id,
+                           "error": f"timeout after {polls} polls"})
+            continue
+
+        if req.get("result_type") == "NOT_FOUND":
+            no_match.append({"input": input_dict, "request_id": request_id})
+            continue
+        if req.get("result_type") == "LOW_CONF":
+            low_conf.append({"input": input_dict, "request_id": request_id})
+            continue
+
+        results = fetch_results(api_key, request_id)
+        if results.get("source") == "no_match":
+            no_match.append({"input": input_dict, "request_id": request_id})
+            continue
+        company = results.get("company") or {}
+        if results.get("source") == "database" and company:
+            company = _normalize_database_fields(company)
+        matched.append(company)
+
+    return {
+        "matched":  matched,
+        "no_match": no_match,
+        "low_conf": low_conf,
+        "failed":   failed,
+        "rejected": body.get("rejected") or [],
+        "budget": {
+            "budget_remaining_at_start": body.get("budget_remaining_at_start"),
+            "budget_consumed":           body.get("budget_consumed"),
+            "budget_remaining":          body.get("budget_remaining"),
+            "budget_capped":             body.get("budget_capped"),
+            "budget_resets_at":          body.get("budget_resets_at"),
+        },
+    }
 
 
 # Field name mapping: database source → enrichment source
