@@ -42,7 +42,7 @@ def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
     payload = _cascade_payload({**kwargs, **({"domain": domain} if domain else {})})
     if not payload:
         raise ValueError("submit() requires at least one cascade-input field.")
-    url = f"{BASE_URL}/api/v1/enrichment/"
+    url = f"{BASE_URL}/api/v1/companies/enrich/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -54,8 +54,9 @@ def submit_bulk(api_key: str, companies: list[dict]) -> dict:
     Each entry may carry any of the cascade-input keys
     (gid_company, grizz_id, domain, company_name, hq_city, hq_state,
     hq_country, hq_phone).  Server enforces the soft-cap to the org's
-    remaining monthly budget — see the Grizz API docs §10 + the /enrichment/bulk/
-    endpoint docs.  Returns the bulk response body verbatim:
+    remaining monthly budget — see the Grizz API docs §10 + the
+    /api/v1/companies/enrich-bulk/ endpoint docs.  Returns the bulk
+    response body verbatim:
 
         {
           "submitted":     N,
@@ -69,7 +70,7 @@ def submit_bulk(api_key: str, companies: list[dict]) -> dict:
         }
     """
     payload = {"companies": [_cascade_payload(c) for c in companies]}
-    url = f"{BASE_URL}/api/v1/enrichment/bulk/"
+    url = f"{BASE_URL}/api/v1/companies/enrich-bulk/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
     # 207 (multi-status) and 429 (budget-capped) are both valid responses
     # carrying full body content — don't raise on them.
@@ -89,15 +90,43 @@ def get_budget(api_key: str) -> dict:
           "resets_at":     iso8601
         }
     """
-    url = f"{BASE_URL}/api/v1/enrichment/budget/"
+    url = f"{BASE_URL}/api/v1/companies/enrich/budget/"
     resp = requests.get(url, headers=_headers(api_key), timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 
+def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
+    """Batch read-only cascade lookup.
+
+    Takes up to 5000 input dicts (each with any cascade-input fields —
+    gid_company, grizz_id, domain, company_name, hq_*) and returns Grizz's
+    structured view per input.  No EnrichmentRequest rows are created and
+    no credits are charged.
+
+    Used by the MCP's `get_crm_companies` and `update_crm_companies` tools
+    to fetch Grizz's view for a list of CRM accounts when composing per-
+    account status or building update payloads.
+
+    Returns a list of:
+        {
+          "input":     {...},
+          "matched":   bool,
+          "match_via": "gid_company" | "grizz_id" | "domain" | "fuzzy" | null,
+          "company":   {gid_company, domain, company_name, naics,
+                         employee_range, ...} | null
+        }
+    """
+    payload = {"lookups": [_cascade_payload(l) for l in lookups]}
+    url = f"{BASE_URL}/api/v1/companies/lookup-batch/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
+    resp.raise_for_status()
+    return resp.json().get("matches", [])
+
+
 def poll_status(api_key: str, request_id: str) -> dict:
     """Check the status of an in-flight enrichment request."""
-    url = f"{BASE_URL}/api/v1/enrichment/{request_id}/"
+    url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/"
     resp = requests.get(url, headers=_headers(api_key), timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -105,7 +134,7 @@ def poll_status(api_key: str, request_id: str) -> dict:
 
 def fetch_results(api_key: str, request_id: str) -> dict:
     """Fetch enriched data for a completed request. Marks the result as retrieved."""
-    url = f"{BASE_URL}/api/v1/enrichment/{request_id}/results/"
+    url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/results/"
     resp = requests.get(url, headers=_headers(api_key), timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -148,7 +177,7 @@ def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) ->
     if status != "COMPLETE":
         raise TimeoutError(
             f"Timed out after {polls} polls (last status: {status}). "
-            f"Check manually: GET {BASE_URL}/api/v1/enrichment/{request_id}/"
+            f"Check manually: GET {BASE_URL}/api/v1/companies/enrich/{request_id}/"
         )
 
     results = fetch_results(api_key, request_id)
@@ -170,7 +199,7 @@ def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) ->
 def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
     """Submit a batch of companies and fetch every completed result.
 
-    Submits via POST /api/v1/enrichment/bulk/, polls each PENDING request
+    Submits via POST /api/v1/companies/enrich-bulk/, polls each PENDING request
     until COMPLETE/FAILED, then fetches results.  Each matched/no_match/
     low_conf/failed entry carries its `input` dict so callers can map
     results back to the input cohort.

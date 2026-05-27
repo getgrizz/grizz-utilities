@@ -7,6 +7,34 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.0] — 2026-05-27
+
+### Added
+- `grizz_client.lookup_batch(api_key, lookups)` — read-only batch
+  cascade lookup against `POST /api/v1/companies/lookup-batch/`.  Up to
+  5000 inputs per call, no credits charged, returns Grizz's structured
+  view per record.  Used by upcoming MCP `get_crm_companies` and
+  `update_crm_companies` tools to compose per-account status without
+  burning credits.
+
+### Changed
+- **BREAKING — endpoint renames (no redirects).**  All `/api/v1/*` paths
+  brought into line with the canonical noun convention in the Grizz API docs §2.
+  Customers calling the API directly must update their URLs:
+
+      /api/v1/enrichment/             → /api/v1/companies/enrich/
+      /api/v1/enrichment/bulk/        → /api/v1/companies/enrich-bulk/
+      /api/v1/enrichment/budget/      → /api/v1/companies/enrich/budget/
+      /api/v1/enrichment/<id>/        → /api/v1/companies/enrich/<id>/
+      /api/v1/enrichment/<id>/results/ → /api/v1/companies/enrich/<id>/results/
+      /api/v1/admin/crm-coverage-reports/ → /api/v1/admin/crm-coverage/
+      /api/v1/admin/crm-mappings/     → /api/v1/admin/crm-field-mappings/
+
+  Old paths return 404.  See the Grizz API docs §11 (Tool ↔ Endpoint Mapping)
+  for the full table.
+
+---
+
 ## [0.3.0] — 2026-05-27
 
 ### Added
