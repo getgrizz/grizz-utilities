@@ -7,6 +7,21 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.5.0] — 2026-05-28
+
+### Added
+- `grizz_client.tech_gap(api_key, crm, credentials, ...)` — wraps
+  `POST /api/v1/companies/tech-gap/`.  Server-side orchestration returns
+  the combined tech-gap list (in_crm + not_in_crm) with per-signal status.
+- `grizz_client.create_in_crm(api_key, crm, credentials, records, ...)` —
+  wraps `POST /api/v1/companies/create-crm/`.  Universal Step 4 of the
+  company-resolution flow: creates new CRM accounts from Grizz data.
+
+Both are paired 1:1 with the MCP tools `get_tech_gap_companies` and
+`create_crm_companies` for parallel naming end-to-end.
+
+---
+
 ## [0.4.0] — 2026-05-27
 
 ### Added

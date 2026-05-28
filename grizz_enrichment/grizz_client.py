@@ -104,9 +104,8 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
     structured view per input.  No EnrichmentRequest rows are created and
     no credits are charged.
 
-    Used by the MCP's `get_crm_companies` and `update_crm_companies` tools
-    to fetch Grizz's view for a list of CRM accounts when composing per-
-    account status or building update payloads.
+    Used internally by orchestrator endpoints (tech-gap, create-crm) and
+    available to MCP tools that need Grizz's view for a list of records.
 
     Returns a list of:
         {
@@ -122,6 +121,71 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
     resp.raise_for_status()
     return resp.json().get("matches", [])
+
+
+def tech_gap(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    field_mapping: dict | None = None,
+    limit: int = 500,
+) -> dict:
+    """Pair of `get_tech_gap_companies` MCP tool — the combined tech-gap
+    list, both halves (in_crm + not_in_crm) in one call.
+
+    Server-side orchestration: pulls customer's CRM accounts, queries
+    Grizz universe in ICP scope, composes per-record presence + status.
+    Credentials live only in server worker memory for the request.
+
+    Returns the response body verbatim from
+    POST /api/v1/companies/tech-gap/:
+        {
+          "crm":              "salesforce",
+          "count":            int,
+          "in_crm_count":     int,
+          "not_in_crm_count": int,
+          "limit":            int,
+          "records":          [{crm_id, presence, gid_company, ..., status}]
+        }
+    """
+    payload: dict = {"crm": crm, "credentials": credentials, "limit": limit}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    url = f"{BASE_URL}/api/v1/companies/tech-gap/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_in_crm(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    records: list[dict],
+    field_mapping: dict | None = None,
+    native_field_mapping: dict | None = None,
+) -> dict:
+    """Pair of `create_crm_companies` MCP tool — universal Step 4 of the
+    company-resolution flow.
+
+    Server-side orchestration: for each input record, looks up Grizz's
+    view via the cascade, builds a CRM create payload from every Grizz_*
+    field, and POSTs to the customer's CRM (Salesforce composite/sobjects
+    or HubSpot batch/create).  Returns per-record outcome with new crm_ids.
+
+    Up to 5000 records per call; credentials live only in the Grizz backend worker
+    memory.  Returns the response body verbatim from
+    POST /api/v1/companies/create-crm/.
+    """
+    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    if native_field_mapping is not None:
+        payload["native_field_mapping"] = native_field_mapping
+    url = f"{BASE_URL}/api/v1/companies/create-crm/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def poll_status(api_key: str, request_id: str) -> dict:
