@@ -157,6 +157,57 @@ def tech_gap(
     return resp.json()
 
 
+def get_crm(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    filter: str = "stale",
+    field_mapping: dict | None = None,
+    limit: int = 500,
+    stale_days: int = 60,
+) -> dict:
+    """Pair of the `get_crm_companies` MCP tool — paginated CRM detail rows
+    with per-account Grizz status.
+
+    Wraps POST /api/v1/companies/get-crm/.  Server-side: pulls the
+    customer's CRM, filters by Last Sync status (awaiting / stale / all),
+    joins Grizz's view via the cascade.  Returns the response body
+    verbatim: {crm, filter, count, limit, records}.
+    """
+    payload: dict = {"crm": crm, "credentials": credentials,
+                     "filter": filter, "limit": limit, "stale_days": stale_days}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    url = f"{BASE_URL}/api/v1/companies/get-crm/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_crm(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    records: list[dict],
+    field_mapping: dict | None = None,
+) -> dict:
+    """Pair of the `update_crm_companies` MCP tool — rewrite Grizz_* fields
+    on existing CRM accounts.
+
+    Wraps POST /api/v1/companies/update-crm/.  Server-side: resolves
+    crm_id for records lacking one, looks up Grizz data, rewrites every
+    Grizz_* field, stamps Grizz Last Sync.  Native fields untouched.
+    Returns the response body verbatim.
+    """
+    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    url = f"{BASE_URL}/api/v1/companies/update-crm/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def create_in_crm(
     api_key: str,
     crm: str,

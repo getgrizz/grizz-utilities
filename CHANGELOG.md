@@ -16,9 +16,17 @@ This project uses [Semantic Versioning](https://semver.org/).
 - `grizz_client.create_in_crm(api_key, crm, credentials, records, ...)` —
   wraps `POST /api/v1/companies/create-crm/`.  Universal Step 4 of the
   company-resolution flow: creates new CRM accounts from Grizz data.
+- `grizz_client.get_crm(api_key, crm, credentials, filter, ...)` — wraps
+  `POST /api/v1/companies/get-crm/`.  Paginated CRM detail rows with
+  per-account Grizz status (filter: awaiting / stale / all).
+- `grizz_client.update_crm(api_key, crm, credentials, records, ...)` —
+  wraps `POST /api/v1/companies/update-crm/`.  Rewrites Grizz_* fields
+  on existing CRM accounts.
 
-Both are paired 1:1 with the MCP tools `get_tech_gap_companies` and
-`create_crm_companies` for parallel naming end-to-end.
+All four are paired 1:1 with their MCP tools (`get_tech_gap_companies`,
+`create_crm_companies`, `get_crm_companies`, `update_crm_companies`) for
+parallel naming end-to-end.  The whole company surface is now
+server-side orchestrated — the MCP holds no CRM read/write logic.
 
 ---
 
