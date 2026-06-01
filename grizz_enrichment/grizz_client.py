@@ -234,6 +234,34 @@ def get_crm_contacts(
     return resp.json()
 
 
+def create_in_crm_contacts(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    records: list[dict],
+    field_mapping: dict | None = None,
+    native_field_mapping: dict | None = None,
+) -> dict:
+    """Pair of the `create_crm_contacts` MCP tool — create new CRM contacts
+    from Grizz-known person records, linking each to its parent CRM account.
+
+    Wraps POST /api/v1/people/create-crm/.  Server-side: looks up Grizz's
+    view per record, resolves the parent gid_company to a CRM account_id,
+    writes native columns + Grizz_Contact_* + parent linkage in one
+    operation.  Contacts whose parent isn't in the CRM come back as
+    `no_parent_match` (use create_crm_companies to create the parent first).
+    """
+    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    if native_field_mapping is not None:
+        payload["native_field_mapping"] = native_field_mapping
+    url = f"{BASE_URL}/api/v1/people/create-crm/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def update_crm_contacts(
     api_key: str,
     crm: str,
