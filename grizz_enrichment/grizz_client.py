@@ -208,6 +208,32 @@ def update_crm(
     return resp.json()
 
 
+def get_crm_contacts(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    filter: str = "all",
+    field_mapping: dict | None = None,
+    limit: int = 500,
+) -> dict:
+    """Pair of the `get_crm_contacts` MCP tool — paginated CRM contact rows
+    with the Grizz Contact view joined in.
+
+    Wraps POST /api/v1/people/get-crm/.  Server-side: pulls the customer's
+    CRM contacts, filters by `all` or `unmatched` (no Grizz dedup stamp),
+    joins Grizz's view via the cascade.  Returns the response body
+    verbatim: {crm, filter, count, limit, records}.
+    """
+    payload: dict = {"crm": crm, "credentials": credentials,
+                     "filter": filter, "limit": limit}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    url = f"{BASE_URL}/api/v1/people/get-crm/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def update_crm_contacts(
     api_key: str,
     crm: str,
