@@ -12,6 +12,24 @@ POLL_INTERVAL = 5   # seconds between status checks
 MAX_POLLS = 24      # give up after 2 minutes
 
 
+def _raise_with_body(resp: "requests.Response") -> None:
+    """Drop-in replacement for ``resp.raise_for_status()`` that folds the
+    response body into the raised HTTPError's message, so callers (the MCP,
+    customer scripts) see the actual server ``{"detail": "..."}`` instead of
+    just '502 Server Error'.
+    """
+    if resp.status_code < 400:
+        return
+    try:
+        body = (resp.text or "")[:500].strip()
+    except Exception:
+        body = "<unreadable body>"
+    msg = f"{resp.status_code} {resp.reason} for url: {resp.url}"
+    if body:
+        msg = f"{msg} — {body}"
+    raise requests.HTTPError(msg, response=resp)
+
+
 def _headers(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -44,7 +62,7 @@ def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
         raise ValueError("submit() requires at least one cascade-input field.")
     url = f"{BASE_URL}/api/v1/companies/enrich/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=30)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -75,7 +93,7 @@ def submit_bulk(api_key: str, companies: list[dict]) -> dict:
     # 207 (multi-status) and 429 (budget-capped) are both valid responses
     # carrying full body content — don't raise on them.
     if resp.status_code not in (200, 201, 207, 429):
-        resp.raise_for_status()
+        _raise_with_body(resp)
     return resp.json()
 
 
@@ -92,7 +110,7 @@ def get_budget(api_key: str) -> dict:
     """
     url = f"{BASE_URL}/api/v1/companies/enrich/budget/"
     resp = requests.get(url, headers=_headers(api_key), timeout=15)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -119,7 +137,7 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
     payload = {"lookups": [_cascade_payload(l) for l in lookups]}
     url = f"{BASE_URL}/api/v1/companies/lookup-batch/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json().get("matches", [])
 
 
@@ -153,7 +171,7 @@ def tech_gap(
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/companies/tech-gap/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -180,7 +198,7 @@ def get_crm(
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/companies/get-crm/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -204,7 +222,7 @@ def update_crm(
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/companies/update-crm/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -229,7 +247,7 @@ def persona_gap(
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/people/persona-gap/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -255,7 +273,7 @@ def get_crm_contacts(
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/people/get-crm/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -283,7 +301,7 @@ def create_in_crm_contacts(
         payload["native_field_mapping"] = native_field_mapping
     url = f"{BASE_URL}/api/v1/people/create-crm/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -307,7 +325,7 @@ def update_crm_contacts(
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/people/update-crm/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -338,7 +356,7 @@ def create_in_crm(
         payload["native_field_mapping"] = native_field_mapping
     url = f"{BASE_URL}/api/v1/companies/create-crm/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -346,7 +364,7 @@ def poll_status(api_key: str, request_id: str) -> dict:
     """Check the status of an in-flight enrichment request."""
     url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/"
     resp = requests.get(url, headers=_headers(api_key), timeout=30)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -354,7 +372,7 @@ def fetch_results(api_key: str, request_id: str) -> dict:
     """Fetch enriched data for a completed request. Marks the result as retrieved."""
     url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/results/"
     resp = requests.get(url, headers=_headers(api_key), timeout=30)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
