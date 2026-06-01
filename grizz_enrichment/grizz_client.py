@@ -208,6 +208,31 @@ def update_crm(
     return resp.json()
 
 
+def persona_gap(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    field_mapping: dict | None = None,
+    limit: int = 500,
+) -> dict:
+    """Pair of the `get_persona_gap_contacts` MCP tool — the prospecting
+    list of ICP-persona contacts at the customer's CRM accounts that aren't
+    in their CRM yet.  Server-side: pulls accounts + contacts, queries
+    Grizz Persons matching the org's ICP personas at those accounts,
+    excludes any already represented.  Returns the body verbatim from
+    POST /api/v1/people/persona-gap/:
+        {crm, count, limit, icp_personas, records: [...]}.
+    Each record is ready to pass into create_crm_contacts.
+    """
+    payload: dict = {"crm": crm, "credentials": credentials, "limit": limit}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    url = f"{BASE_URL}/api/v1/people/persona-gap/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def get_crm_contacts(
     api_key: str,
     crm: str,
