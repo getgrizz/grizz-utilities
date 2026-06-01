@@ -208,6 +208,30 @@ def update_crm(
     return resp.json()
 
 
+def update_crm_contacts(
+    api_key: str,
+    crm: str,
+    credentials: dict,
+    records: list[dict],
+    field_mapping: dict | None = None,
+) -> dict:
+    """Pair of the `update_crm_contacts` MCP tool — rewrite Grizz_Contact_*
+    fields on existing CRM contacts.
+
+    Wraps POST /api/v1/people/update-crm/.  Server-side: looks up Grizz's view
+    per record, rewrites every Grizz_Contact_* field, leaves native columns
+    (FirstName, LastName, Email, Phone, Title, Mailing*) untouched.  Each
+    record needs `crm_id`; records without it come back as no_crm_match.
+    """
+    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    url = f"{BASE_URL}/api/v1/people/update-crm/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def create_in_crm(
     api_key: str,
     crm: str,
