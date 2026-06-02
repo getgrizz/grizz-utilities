@@ -209,19 +209,21 @@ def update_crm(
     records: list[dict],
     field_mapping: dict | None = None,
 ) -> dict:
-    """Pair of the `update_crm_companies` MCP tool — rewrite Grizz_* fields
-    on existing CRM accounts.
+    """Pair of the `update_crm_companies` MCP tool — submit a CRM-account
+    update job and get back a request_id for polling.
 
-    Wraps POST /api/v1/companies/update-crm/.  Server-side: resolves
-    crm_id for records lacking one, looks up Grizz data, rewrites every
-    Grizz_* field, stamps Grizz Last Sync.  Native fields untouched.
-    Returns the response body verbatim.
+    Wraps POST /api/v1/companies/update-crm/.  The server queues the
+    work on Celery (the SF Account-table pagination that runs when
+    records lack crm_id alone can exceed the gunicorn worker timeout)
+    and returns 202 with `{request_id, status: "PENDING", total}`
+    immediately.  Poll `check_crm_write_request(request_id)` for the
+    final result.
     """
     payload: dict = {"crm": crm, "credentials": credentials, "records": records}
     if field_mapping is not None:
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/companies/update-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
     _raise_with_body(resp)
     return resp.json()
 
