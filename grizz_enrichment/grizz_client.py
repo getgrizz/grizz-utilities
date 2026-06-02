@@ -320,6 +320,52 @@ def check_crm_write_request(api_key: str, request_id: str) -> dict:
     return resp.json()
 
 
+def enrich_contacts_batch(
+    api_key: str,
+    gids: list[str],
+    include_email: bool = True,
+    include_phone: bool = False,
+) -> dict:
+    """Pair of the `enrich_contacts` MCP tool — submit a bulk enrich job.
+
+    Wraps POST /api/v1/people/enrich-batch/.  The server fans out one
+    per-(gid, contact_type) Celery task per requested field and returns
+    202 with {request_id, status: "PENDING", total_contacts} immediately.
+    Poll `check_person_enrich_batch(request_id)` for the final result.
+
+    Doing this as one submit + one poll (instead of N submits + N polls)
+    is what makes bulk enrich practical: 800 companies' worth of contacts
+    can't fit inside an MCP tool call's wall-clock budget if every contact
+    is polled sequentially from the client side.
+    """
+    payload = {
+        "gids":          gids,
+        "include_email": include_email,
+        "include_phone": include_phone,
+    }
+    url = f"{BASE_URL}/api/v1/people/enrich-batch/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
+    _raise_with_body(resp)
+    return resp.json()
+
+
+def check_person_enrich_batch(api_key: str, request_id: str) -> dict:
+    """Pair of the `check_person_enrich_batch` MCP tool — poll a bulk enrich job.
+
+    Wraps GET /api/v1/people/enrich-batch/<request_id>/.  Returns:
+      - While running: {status: "PENDING" | "RUNNING", request_id,
+        completed, failed, pending, total_requests, total_contacts}
+      - On completion: same plus {found_email, found_phone, results: [
+        {gid, email, phone, email_entitled, phone_entitled}, ...
+      ]}
+      - On failure: {status: "FAILED", error_message}
+    """
+    url = f"{BASE_URL}/api/v1/people/enrich-batch/{request_id}/"
+    resp = requests.get(url, headers=_headers(api_key), timeout=30)
+    _raise_with_body(resp)
+    return resp.json()
+
+
 def update_crm_contacts(
     api_key: str,
     crm: str,
