@@ -285,14 +285,13 @@ def create_in_crm_contacts(
     field_mapping: dict | None = None,
     native_field_mapping: dict | None = None,
 ) -> dict:
-    """Pair of the `create_crm_contacts` MCP tool — create new CRM contacts
-    from Grizz-known person records, linking each to its parent CRM account.
+    """Pair of the `create_crm_contacts` MCP tool — submit a create job and
+    get back a request_id for polling.
 
-    Wraps POST /api/v1/people/create-crm/.  Server-side: looks up Grizz's
-    view per record, resolves the parent gid_company to a CRM account_id,
-    writes native columns + Grizz_Contact_* + parent linkage in one
-    operation.  Contacts whose parent isn't in the CRM come back as
-    `no_parent_match` (use create_crm_companies to create the parent first).
+    Wraps POST /api/v1/people/create-crm/.  The server queues the work on
+    Celery (parent linking + creates can run for minutes on 50-100+ contacts)
+    and returns 202 with `{request_id, status: "PENDING", total}` immediately.
+    Poll `check_crm_write_request(request_id)` for the final result.
     """
     payload: dict = {"crm": crm, "credentials": credentials, "records": records}
     if field_mapping is not None:
@@ -300,7 +299,23 @@ def create_in_crm_contacts(
     if native_field_mapping is not None:
         payload["native_field_mapping"] = native_field_mapping
     url = f"{BASE_URL}/api/v1/people/create-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
+    _raise_with_body(resp)
+    return resp.json()
+
+
+def check_crm_write_request(api_key: str, request_id: str) -> dict:
+    """Pair of the `check_crm_write_request` MCP tool — poll a CRM write job.
+
+    Wraps GET /api/v1/crm-write-requests/<request_id>/.  Returns:
+      - {status: "PENDING" | "RUNNING", request_id, kind, crm, total}
+        while the job is still working.
+      - {status: "COMPLETE", ..., results: [...], created, no_grizz_match,
+        no_parent_match, parent_linked, errors} when done.
+      - {status: "FAILED", error_message} on failure.
+    """
+    url = f"{BASE_URL}/api/v1/crm-write-requests/{request_id}/"
+    resp = requests.get(url, headers=_headers(api_key), timeout=30)
     _raise_with_body(resp)
     return resp.json()
 
