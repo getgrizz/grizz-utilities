@@ -228,10 +228,12 @@ def _run_update_batches(
     records: list[dict],
     batch_size: int,
     console: Console,
+    interactive: bool = True,
 ) -> tuple[int, list[dict]]:
     """Send records to the CRM in batches. Returns (updated_count, failed_records).
 
-    On completion, if any batches failed the user is prompted to retry once.
+    On completion, if any batches failed the user is prompted to retry once
+    (or, when non-interactive, the failed records are retried once automatically).
     """
     updated = 0
     failed_records: list[dict] = []
@@ -263,10 +265,14 @@ def _run_update_batches(
             f"\n  [yellow]{len(failed_records)} record(s) failed.[/yellow] "
             f"This is usually a temporary rate-limit issue."
         )
-        retry = questionary.confirm(
-            f"Retry the {len(failed_records)} failed record(s) now?",
-            default=True,
-        ).ask()
+        if interactive:
+            retry = questionary.confirm(
+                f"Retry the {len(failed_records)} failed record(s) now?",
+                default=True,
+            ).ask()
+        else:
+            retry = True
+            console.print("  [dim]Non-interactive: retrying failed record(s) once automatically.[/dim]")
         if retry:
             console.print(f"  Retrying {len(failed_records)} record(s)...")
             retry_updated = 0
@@ -376,6 +382,7 @@ def run_audience(
     prompt: str | None = None,
     batch_size: int = 200,
     gids: list[str] | None = None,
+    assume_yes: bool = False,
 ) -> None:
     """Push a Grizz company list into the CRM.
 
@@ -383,7 +390,12 @@ def run_audience(
     audience), or an explicit list of gid_company values (`gids`) — e.g. a
     filtered selection handed off from the Grizz MCP.  Steps 2-5 (match,
     update, create, report) are identical regardless of source.
+
+    When non-interactive (`assume_yes`, or no TTY — e.g. an agent/MCP hand-off or
+    CI), unmatched companies are created without prompting and failed batches are
+    retried once automatically, so the run never blocks on a missing terminal.
     """
+    non_interactive = assume_yes or not sys.stdin.isatty()
 
     # ── Config ──────────────────────────────────────────────────────────────
     config = load_config(config_path)
@@ -543,18 +555,26 @@ def run_audience(
                 console.print(f"  [dim]{r['Id']}: would update {[k for k in r if k != 'Id']}[/dim]")
         else:
             updated, records_to_update = _run_update_batches(
-                adapter, records_to_update, batch_size, console
+                adapter, records_to_update, batch_size, console,
+                interactive=not non_interactive,
             )
         console.print()
 
     # ── Prompt to create unmatched accounts ─────────────────────────────────
     created = 0
     if unmatched:
-        create = questionary.confirm(
-            f"{len(unmatched)} companies could not be matched to an existing account "
-            f"in your CRM. Create new company records?",
-            default=False,
-        ).ask()
+        if non_interactive:
+            create = True
+            console.print(
+                f"{len(unmatched)} unmatched compan(ies) — creating new records "
+                f"(non-interactive)."
+            )
+        else:
+            create = questionary.confirm(
+                f"{len(unmatched)} companies could not be matched to an existing account "
+                f"in your CRM. Create new company records?",
+                default=False,
+            ).ask()
 
         if create:
             console.print()
@@ -668,6 +688,7 @@ def audience(
     gids: Optional[Path] = typer.Option(None, "--gids", help="File of gid_company values (one per line or a CSV with a gid_company column) — e.g. a filtered selection from the Grizz MCP"),
     config: Path = typer.Option(Path("config.yaml"), help="Path to your config.yaml"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing to CRM"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive: create unmatched companies and retry failures without prompting (auto-enabled when not a TTY)"),
     batch_size: int = typer.Option(200, "--batch-size", help="Records per API call when creating accounts (max 200)"),
 ):
     """Push a Grizz company list (audience, prompt, or an explicit gid list) into your CRM."""
@@ -694,7 +715,7 @@ def audience(
 
     batch_size = max(1, min(batch_size, 200))
     run_audience(crm, config, dry_run, audience_id=audience_id, prompt=prompt,
-                 batch_size=batch_size, gids=gid_list)
+                 batch_size=batch_size, gids=gid_list, assume_yes=yes)
 
 
 @app.command()

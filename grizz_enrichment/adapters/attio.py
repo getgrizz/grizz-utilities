@@ -13,6 +13,7 @@ records in {"properties": ...}:
 """
 
 import os
+import time
 
 import requests
 
@@ -22,6 +23,9 @@ _BASE_URL = "https://api.attio.com"
 _OBJECT = "companies"
 _QUERY_BATCH = 100   # values per $in query
 _QUERY_PAGE = 500    # records per query page
+_READ_TIMEOUT = 30   # seconds, GET/query
+_WRITE_TIMEOUT = 60  # seconds, PUT/PATCH/POST (Attio writes can be slow under load)
+_MAX_RETRIES = 4     # transient-failure retries (timeout / connection / 429 / 5xx)
 _URL_PREFIXES = ("https://", "http://", "www.")
 
 # Attio slugs that need special value shaping on write.
@@ -82,10 +86,35 @@ class AttioAdapter(CRMAdapter):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         })
-        resp = self._session.get(f"{_BASE_URL}/v2/self", timeout=10)
+        resp = self._session.get(f"{_BASE_URL}/v2/self", timeout=_READ_TIMEOUT)
         if resp.status_code == 401:
             raise RuntimeError("ATTIO_API_KEY is invalid or lacks required scopes.")
         resp.raise_for_status()
+
+    def _request(self, method: str, url: str, *, timeout: int, **kwargs) -> requests.Response:
+        """HTTP with retry/backoff on transient failures (timeout, connection drop,
+        429, 5xx).  Non-transient 4xx responses are returned for the caller to
+        raise_for_status; transient exceptions are re-raised only after exhausting
+        retries.  Attio has no batch write API, so each record is its own request —
+        making single-request resilience the right place to absorb blips."""
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = self._session.request(method, url, timeout=timeout, **kwargs)
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last_exc = e
+                if attempt < _MAX_RETRIES:
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
+                raise
+            if resp.status_code == 429 and attempt < _MAX_RETRIES:
+                time.sleep(int(resp.headers.get("Retry-After", "5")))
+                continue
+            if resp.status_code >= 500 and attempt < _MAX_RETRIES:
+                time.sleep(min(2 ** attempt, 10))
+                continue
+            return resp
+        raise last_exc  # pragma: no cover
 
     # ── reads ────────────────────────────────────────────────────────────────
 
@@ -94,10 +123,10 @@ class AttioAdapter(CRMAdapter):
         out: list[dict] = []
         offset = 0
         while True:
-            resp = self._session.post(
-                f"{_BASE_URL}/v2/objects/{_OBJECT}/records/query",
+            resp = self._request(
+                "POST", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/query",
+                timeout=_READ_TIMEOUT,
                 json={"filter": filter_, "limit": _QUERY_PAGE, "offset": offset},
-                timeout=30,
             )
             resp.raise_for_status()
             batch = resp.json().get("data", [])
@@ -108,8 +137,9 @@ class AttioAdapter(CRMAdapter):
 
     def get_domain(self, record_id: str, domain_field: str) -> str | None:
         """Return the company's primary domain (domain_field is 'domains')."""
-        resp = self._session.get(
-            f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}", timeout=10,
+        resp = self._request(
+            "GET", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}",
+            timeout=_READ_TIMEOUT,
         )
         resp.raise_for_status()
         domains = resp.json().get("data", {}).get("values", {}).get(domain_field, [])
@@ -180,18 +210,25 @@ class AttioAdapter(CRMAdapter):
                 values[slug] = value
         return values
 
+    @staticmethod
+    def _err(e: Exception) -> str:
+        resp = getattr(e, "response", None)
+        return resp.text[:200] if resp is not None else f"{type(e).__name__}: {e}"
+
     def update_record(self, record_id: str, fields: dict) -> None:
         """Patch a single company record."""
-        resp = self._session.patch(
-            f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}",
-            json={"data": {"values": self._shape(fields)}}, timeout=15,
+        resp = self._request(
+            "PATCH", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}",
+            timeout=_WRITE_TIMEOUT, json={"data": {"values": self._shape(fields)}},
         )
         resp.raise_for_status()
 
     def update_accounts(self, records: list[dict]) -> list[dict]:
         """Update companies one record at a time (Attio has no batch write API).
 
-        Each record must include an 'Id' key.
+        Each record must include an 'Id' key.  Per-record failures (including
+        timeouts/connection drops, after retries) are isolated — one bad record
+        never fails the rest of the batch.
         """
         results: list[dict] = []
         for r in records:
@@ -199,24 +236,25 @@ class AttioAdapter(CRMAdapter):
             try:
                 self.update_record(record_id, r)
                 results.append({"id": record_id, "success": True, "errors": []})
-            except requests.HTTPError as e:
-                body = e.response.text[:200] if e.response is not None else str(e)
-                results.append({"id": record_id, "success": False, "errors": [body]})
+            except requests.RequestException as e:
+                results.append({"id": record_id, "success": False, "errors": [self._err(e)]})
         return results
 
     def create_accounts(self, records: list[dict]) -> list[dict]:
-        """Create companies one record at a time (Attio has no batch write API)."""
+        """Create companies one record at a time (Attio has no batch write API).
+
+        Per-record failures are isolated, same as update_accounts.
+        """
         results: list[dict] = []
         for r in records:
             try:
-                resp = self._session.post(
-                    f"{_BASE_URL}/v2/objects/{_OBJECT}/records",
-                    json={"data": {"values": self._shape(r)}}, timeout=15,
+                resp = self._request(
+                    "POST", f"{_BASE_URL}/v2/objects/{_OBJECT}/records",
+                    timeout=_WRITE_TIMEOUT, json={"data": {"values": self._shape(r)}},
                 )
                 resp.raise_for_status()
                 new_id = resp.json().get("data", {}).get("id", {}).get("record_id", "")
                 results.append({"id": new_id, "success": True, "errors": []})
-            except requests.HTTPError as e:
-                body = e.response.text[:200] if e.response is not None else str(e)
-                results.append({"id": "", "success": False, "errors": [body]})
+            except requests.RequestException as e:
+                results.append({"id": "", "success": False, "errors": [self._err(e)]})
         return results

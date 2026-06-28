@@ -9,6 +9,20 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Attio adapter resilience: a read timeout or connection drop on a single write no
+  longer fails the whole batch. Writes (and reads) now retry transient failures —
+  timeout, connection drop, 429 (honoring Retry-After), and 5xx — with backoff,
+  and per-record errors are isolated (one bad record never aborts the rest). The
+  write timeout was also raised from 15s to 60s (Attio writes can be slow under
+  load).
+
+### Changed
+- `audience` runs non-interactively when `--yes/-y` is passed or stdout/stdin is
+  not a TTY (e.g. an agent/MCP hand-off or CI): unmatched companies are created
+  and failed batches retried once without prompting, so a run never blocks waiting
+  on a terminal that isn't there.
+
 ### Added
 - `audience --gids <file>` — push an explicit list of `gid_company` values (one
   per line, or a CSV with a `gid_company` column) instead of a whole audience.
