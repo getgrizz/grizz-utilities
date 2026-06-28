@@ -5,12 +5,11 @@ Enrich your CRM account records with Grizz construction company data — firmogr
 **Supported CRMs:** Salesforce, HubSpot, Attio
 **Coming soon:** Pipedrive, Zoho
 
-> **Attio works differently from the others.** Matching and field-mapping happen
-> server-side at Grizz, and records are deduplicated natively on the company
-> `domains` attribute — so there is no `config.yaml` to fill in and no CSV of
-> account IDs. Attio is **audience-driven**: you point the tool at a Grizz
-> audience (typically an A/B/C tier) and it upserts those companies. See
-> [Attio](#attio) below.
+All three CRMs work the same way — same `setup`, `enrich`, and `audience`
+commands, same `config.yaml` mapping. Attio has only a couple of small,
+design-forced differences (its `setup` also needs your Grizz key, and it
+deduplicates on the native `domains` attribute); see [Attio](#attio) for the
+specifics.
 
 ---
 
@@ -141,7 +140,7 @@ python run.py enrich --crm hubspot --input companies.csv
 
 | Flag | Description |
 |---|---|
-| `--crm` | CRM to use: `salesforce` or `hubspot` |
+| `--crm` | CRM to use: `salesforce`, `hubspot`, or `attio` |
 | `--input` | Path to CSV file with an `Id` or `Account ID` column |
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--dry-run` | Preview changes without writing to the CRM |
@@ -160,7 +159,7 @@ python run.py audience --crm hubspot --prompt "Mid-market US roofing contractors
 |---|---|
 | `--audience-id` | ID of an existing Grizz audience |
 | `--prompt` | Natural language prompt to create a new audience |
-| `--crm` | CRM to use: `salesforce` or `hubspot` |
+| `--crm` | CRM to use: `salesforce`, `hubspot`, or `attio` |
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--batch-size` | Records per API call when creating accounts (default: `200`, max: `200`) |
 | `--dry-run` | Preview changes without writing to the CRM |
@@ -281,15 +280,16 @@ The integration uses a **Legacy App access token**. Here's how to create one:
 
 ## Attio
 
-Attio is **headless**: unlike the Salesforce and HubSpot adapters, Grizz resolves
-each company and builds the Attio-ready write payload server-side, and the upsert
-deduplicates natively on Attio's unique `domains` attribute. As a result:
+Attio uses the **same `setup` / `enrich` / `audience` flow** as Salesforce and
+HubSpot — same `config.yaml` mapping, same matching (by Grizz company ID, then
+domain), same create/update behavior. There are only two design-forced
+differences, and the tool handles both for you:
 
-- **No `config.yaml`.** Field mapping is server-side; you don't map anything.
-- **No CSV / `enrich` command.** The Attio flow is audience-driven — point it at a
-  Grizz audience (typically an A/B/C tier) and it upserts those companies.
-- **Grizz never holds your Attio key.** You supply it at runtime via
-  `ATTIO_API_KEY`; the calls to Attio run from this tool, on your machine.
+- **`setup --crm attio` needs your Grizz key too.** Attio's attribute list is
+  pulled from Grizz at runtime (so it always matches the current Grizz schema)
+  rather than hardcoded, so set `GRIZZ_API_KEY` alongside `ATTIO_API_KEY`.
+- **Dedup is on the native `domains` attribute.** Attio has no Grizz domain field;
+  the company's domain is written to native `domains` only when creating a record.
 
 **Credentials** — add both to your `.env`:
 
@@ -298,33 +298,30 @@ deduplicates natively on Attio's unique `domains` attribute. As a result:
 | `GRIZZ_API_KEY` | [getgrizz.com/dashboard](https://getgrizz.com/dashboard) |
 | `ATTIO_API_KEY` | Attio → *Workspace settings → Developers → API keys → Create*. Grant read/write on **Objects → Companies** (records + attributes). |
 
-**1. Provision the Grizz attributes** (once per workspace — idempotent, skips any
-that already exist):
+**1. Create the Grizz attributes** (once per workspace — idempotent, skips any that
+already exist):
 
 ```bash
 python run.py setup --crm attio
 python run.py setup --crm attio --dry-run   # preview what would be created
 ```
 
-The field list comes from Grizz at runtime (so it always matches the current Grizz
-schema), which is why `setup --crm attio` needs `GRIZZ_API_KEY` as well as
-`ATTIO_API_KEY`. The Attio API (not its MCP) is the only way to create custom
-attributes, so this step runs over REST.
+The Attio API (not its MCP) is the only way to create custom attributes, so this
+step runs over REST.
 
-**2. Sync a Grizz audience into Attio:**
+**2. Enrich existing Attio companies from a CSV**, or **push a Grizz audience** —
+exactly like the other CRMs:
 
 ```bash
+python run.py enrich   --crm attio --input company_record_ids.csv
 python run.py audience --crm attio --audience-id <uuid>
-python run.py audience --crm attio --audience-id <uuid> --dry-run
+python run.py audience --crm attio --prompt "Mid-market US roofing contractors"
 ```
 
-Build the audience first (an A/B/C tier, or any audience) at
-[getgrizz.com/dashboard](https://getgrizz.com/dashboard) or via the Grizz MCP, then
-pass its `--audience-id`. The tool fetches the audience, asks Grizz to prepare the
-Attio payloads in batches of 200, and upserts each onto the Companies object
-(matching on `domains`: existing accounts are updated, new ones created). Companies
-Grizz doesn't recognize are reported as `no_grizz_match` and skipped. `--prompt` is
-not supported for Attio — build the audience first and pass its id.
+The `audience` flow matches each company to an existing Attio record (by
+`grizz_company_id`, then `domains`), updates the matches, and offers to create the
+rest as new companies. The `attio:` section of `config.yaml` is pre-filled with the
+canonical `grizz_*` slugs — leave it as-is unless you renamed an attribute.
 
 > **Bulk loads are for domain admins.** A full-tier sync reads and writes many CRM
 > records; treat this script as an operator/admin tool, not something every AE or

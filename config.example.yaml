@@ -93,3 +93,51 @@ hubspot:
 
     # ── Other Technology Signals ───────────────────────────────────────────────
     other_tech_signals:    grizz_other_tech_signals
+
+
+# ── Attio ────────────────────────────────────────────────────────────────────
+# Run `python run.py setup --crm attio` to create these attributes first
+# (needs GRIZZ_API_KEY + ATTIO_API_KEY).  The slugs below are the fixed grizz_*
+# attributes Grizz provisions — leave them as-is unless you renamed them.
+# Notes on Attio's design (handled for you):
+#   * `domain_field` is the native `domains` attribute (the unique dedup key);
+#     it is written only when creating a new record, not on update.
+#   * there is no Grizz domain or company-description attribute on Attio.
+
+attio:
+  domain_field: domains
+
+  field_mapping:
+
+    # ── Company Identity ───────────────────────────────────────────────────────
+    grizz_id:              grizz_company_id
+    gid_company:           grizz_gid
+    grizz_url:             grizz_url
+    company_name:          grizz_company_name
+    linkedin_url:          grizz_linkedin_url
+
+    # ── Contact & Location ─────────────────────────────────────────────────────
+    phone:                 grizz_phone
+    email:                 grizz_email
+    city:                  grizz_city
+    state_province_region: grizz_state
+    country:               grizz_country
+
+    # ── Firmographics ──────────────────────────────────────────────────────────
+    employee_range:        grizz_employee_range
+    revenue_range:         grizz_revenue_range
+    naics_code:            grizz_naics
+    grizz_activity:        grizz_activity_classification
+
+    # ── ERP Intelligence ───────────────────────────────────────────────────────
+    erp_tech_stack:        grizz_erp_software
+    erp_match_type:        grizz_erp_match_type
+    erp_keyword_usage:     grizz_erp_keyword_usage
+
+    # ── ATS Intelligence ───────────────────────────────────────────────────────
+    ats_tech_stack:        grizz_ats_software
+    ats_match_type:        grizz_ats_match_type
+    ats_keyword_usage:     grizz_ats_keyword_usage
+
+    # ── Other Technology Signals ───────────────────────────────────────────────
+    other_tech_signals:    grizz_other_tech_signals

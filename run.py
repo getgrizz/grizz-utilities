@@ -30,7 +30,7 @@ from grizz_enrichment.grizz_client import enrich as grizz_enrich
 from grizz_enrichment.mapper import apply_mapping
 from grizz_enrichment.setup_salesforce import run_setup as run_setup_salesforce
 from grizz_enrichment.setup_hubspot import run_setup as run_setup_hubspot
-from grizz_enrichment.attio import run_audience_attio, run_setup_attio
+from grizz_enrichment.setup_attio import run_setup as run_setup_attio
 
 load_dotenv(override=True)
 
@@ -538,6 +538,13 @@ def run_audience(
                         mapped.setdefault("name", company["company_name"])
                     if company.get("domain"):
                         mapped.setdefault("domain", company["domain"])
+                elif crm == "attio":
+                    # Native attributes for brand-new records: company name and
+                    # the unique `domains` match-key (the adapter wraps it in a list).
+                    if company.get("company_name"):
+                        mapped.setdefault("name", company["company_name"])
+                    if company.get("domain"):
+                        mapped.setdefault("domains", company["domain"])
                 records_to_create.append(mapped)
 
             if dry_run:
@@ -603,16 +610,8 @@ def audience(
     batch_size: int = typer.Option(200, "--batch-size", help="Records per API call when creating accounts (max 200)"),
 ):
     """Fetch a Grizz audience, save to CSV, and push new companies into your CRM."""
-    # Attio is headless: matching + mapping happen server-side (prepare-writes) and
-    # the upsert dedups natively on `domains`.  Needs GRIZZ_API_KEY + ATTIO_API_KEY.
-    if crm == "attio":
-        if not audience_id:
-            console.print("[red]Attio sync requires --audience-id (build an A/B/C-tier audience first).[/red]")
-            raise typer.Exit(1)
-        run_audience_attio(audience_id=audience_id, dry_run=dry_run)
-        return
     if crm not in ADAPTERS:
-        console.print(f"[red]Unknown CRM '{crm}'. Available: {', '.join(ADAPTERS)}, attio[/red]")
+        console.print(f"[red]Unknown CRM '{crm}'. Available: {', '.join(ADAPTERS)}[/red]")
         raise typer.Exit(1)
     if not audience_id and not prompt:
         console.print("[red]Provide --audience-id or --prompt.[/red]")
@@ -632,7 +631,7 @@ def setup(
     elif crm == "hubspot":
         run_setup_hubspot(dry_run=dry_run)
     elif crm == "attio":
-        run_setup_attio(dry_run=dry_run)   # provisions grizz_* attributes via the Attio API
+        run_setup_attio(dry_run=dry_run)   # fetches the catalog from Grizz, then provisions over the Attio API
     else:
         console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
         raise typer.Exit(1)
@@ -676,6 +675,8 @@ def main(ctx: typer.Context) -> None:
             run_setup_salesforce(dry_run=bool(dry_run))
         elif crm == "hubspot":
             run_setup_hubspot(dry_run=bool(dry_run))
+        elif crm == "attio":
+            run_setup_attio(dry_run=bool(dry_run))
         else:
             console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
         return

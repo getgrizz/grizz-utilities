@@ -10,22 +10,23 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- Attio support — **headless**, unlike the Salesforce/HubSpot adapters: Grizz
-  resolves and maps each company server-side, and records upsert natively on
-  Attio's unique `domains` attribute, so there is no `config.yaml` and no CSV.
-  Attio is audience-driven.
-- `setup --crm attio` — provisions the `grizz_*` attributes on the Attio
-  Companies and People objects over the Attio REST API (idempotent; the Attio
-  MCP cannot create attributes). The attribute catalog is fetched from Grizz at
-  runtime (not hardcoded), so the tool stays in lock-step with the API/MCP; this
-  is why it needs `GRIZZ_API_KEY` in addition to `ATTIO_API_KEY`.
-- `audience --crm attio --audience-id <uuid>` — bulk-syncs a Grizz audience
-  (typically an A/B/C tier) into Attio. `--prompt` is not supported for Attio.
-- `ATTIO_API_KEY` added to `.env.example`; Grizz never holds the Attio key.
+- **Attio support** as a first-class CRM adapter — it works the same way as the
+  Salesforce/HubSpot adapters: same `setup` / `enrich` / `audience` commands, the
+  same client-side `config.yaml` mapping, the same find-then-update/create flow,
+  and it appears in the interactive menu. New `AttioAdapter` in
+  `grizz_enrichment/adapters/`, registered in `ADAPTERS`.
+- `attio:` section added to `config.example.yaml`, pre-filled with the canonical
+  `grizz_*` attribute slugs.
+- `ATTIO_API_KEY` added to `.env.example`.
 
-### Notes
-- Attio is exposed via the CLI only (operator/admin tool), not the interactive
-  menu. Bulk syncs read/write many CRM records — treat as domain-admin scope.
+### Notes — Attio's two design-forced differences (handled by the adapter)
+- `setup --crm attio` also needs `GRIZZ_API_KEY`: the attribute catalog is fetched
+  from Grizz at runtime (not hardcoded) so it stays in lock-step with the Grizz
+  schema, and is created over the Attio REST API (its MCP cannot create attributes).
+- Dedup/match uses the native `domains` attribute (Attio has no Grizz domain field);
+  domain is written to native `domains` on create only. Matching is by
+  `grizz_company_id` then `domains`. Phone values are normalized to E.164 (Attio
+  rejects records with malformed phone numbers).
 
 ---
 
