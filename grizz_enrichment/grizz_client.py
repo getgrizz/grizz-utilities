@@ -141,6 +141,38 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
     return resp.json().get("matches", [])
 
 
+def prepare_writes(api_key: str, crm: str, records: list[dict]) -> list[dict]:
+    """Headless (Attio) company write prep — resolve + map to CRM-ready payloads.
+
+    Resolves each company through the the Grizz API docs §10 cascade and returns
+    upsert-ready `values` (+ `on_create_values`); Grizz performs no CRM I/O —
+    the caller's CRM does the write.  Max 200 records/call.  Returns the
+    per-record list, each:
+        {"domain", "matched": bool, "values"?, "on_create_values"?}
+    """
+    payload = {"crm": crm, "records": records}
+    url = f"{BASE_URL}/api/v1/companies/prepare-writes/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
+    _raise_with_body(resp)
+    return resp.json().get("records", [])
+
+
+def setup_instructions(api_key: str, crm: str = "attio") -> dict:
+    """Headless (Attio) one-time setup checklist — the grizz_* attribute catalog.
+
+    Read-only.  Rendered server-side from the canonical catalog
+    server-side, so consumers stay in lock-step with the API/MCP
+    instead of hardcoding the schema.  Returns:
+        {"crm", "required_attributes": {<object>: [api_slug, ...]},
+         "attributes": {<object>: [{api_slug, title, type, required}, ...]},
+         "how_to_provision"}
+    """
+    url = f"{BASE_URL}/api/v1/admin/crm-setup-instructions/"
+    resp = requests.get(url, params={"crm": crm}, headers=_headers(api_key), timeout=30)
+    _raise_with_body(resp)
+    return resp.json()
+
+
 def tech_gap(
     api_key: str,
     crm: str,

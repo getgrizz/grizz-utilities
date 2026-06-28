@@ -7,6 +7,28 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- Attio support — **headless**, unlike the Salesforce/HubSpot adapters: Grizz
+  resolves and maps each company server-side, and records upsert natively on
+  Attio's unique `domains` attribute, so there is no `config.yaml` and no CSV.
+  Attio is audience-driven.
+- `setup --crm attio` — provisions the `grizz_*` attributes on the Attio
+  Companies and People objects over the Attio REST API (idempotent; the Attio
+  MCP cannot create attributes). The attribute catalog is fetched from Grizz at
+  runtime (not hardcoded), so the tool stays in lock-step with the API/MCP; this
+  is why it needs `GRIZZ_API_KEY` in addition to `ATTIO_API_KEY`.
+- `audience --crm attio --audience-id <uuid>` — bulk-syncs a Grizz audience
+  (typically an A/B/C tier) into Attio. `--prompt` is not supported for Attio.
+- `ATTIO_API_KEY` added to `.env.example`; Grizz never holds the Attio key.
+
+### Notes
+- Attio is exposed via the CLI only (operator/admin tool), not the interactive
+  menu. Bulk syncs read/write many CRM records — treat as domain-admin scope.
+
+---
+
 ## [0.5.0] — 2026-05-28
 
 ### Added
