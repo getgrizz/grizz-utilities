@@ -14,6 +14,8 @@ records in {"properties": ...}:
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import requests
 
@@ -21,8 +23,11 @@ from .base import CRMAdapter
 
 _BASE_URL = "https://api.attio.com"
 _OBJECT = "companies"
+_GID_SLUG = "grizz_gid"              # gid_company — the canonical driving id (api.md §10)
+_LAST_SYNC_SLUG = "grizz_last_sync"  # stamped (now) on every write so freshness tracks
 _QUERY_BATCH = 100   # values per $in query
 _QUERY_PAGE = 500    # records per query page
+_WRITE_CONCURRENCY = 12  # parallel writes — Attio caps writes at 25/s; 429 bursts back off (Retry-After)
 _READ_TIMEOUT = 30   # seconds, GET/query
 _WRITE_TIMEOUT = 60  # seconds, PUT/PATCH/POST (Attio writes can be slow under load)
 _MAX_RETRIES = 4     # transient-failure retries (timeout / connection / 429 / 5xx)
@@ -64,6 +69,26 @@ def _first(value):
     if isinstance(value, list) and value:
         return value[0].get("value")
     return None
+
+
+def _retry_after_seconds(resp, default: int = 5, cap: int = 30) -> int:
+    """Seconds to wait from a 429's Retry-After header. Per RFC 7231 it may be an
+    integer count OR an HTTP-date — Attio returns the date form, which a plain
+    int() can't parse (that crash failed whole batches). Handles both; capped."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, min(int(raw), cap))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(1, min(int(delta), cap))
+    except Exception:
+        return default
 
 
 def _chunks(seq, n):
@@ -108,7 +133,7 @@ class AttioAdapter(CRMAdapter):
                     continue
                 raise
             if resp.status_code == 429 and attempt < _MAX_RETRIES:
-                time.sleep(int(resp.headers.get("Retry-After", "5")))
+                time.sleep(_retry_after_seconds(resp))
                 continue
             if resp.status_code >= 500 and attempt < _MAX_RETRIES:
                 time.sleep(min(2 ** attempt, 10))
@@ -162,40 +187,62 @@ class AttioAdapter(CRMAdapter):
         return None
 
     def find_accounts_bulk(self, companies: list[dict], grizz_id_field: str) -> dict[str, str]:
-        """Match companies to Attio records by grizz_id_field, then by domain.
+        """Match companies to Attio records, DRIVEN BY gid_company (grizz_gid — the
+        canonical id, api.md §10), then falling back to the native `domains`
+        attribute for records that don't carry a gid yet (e.g. created before gids
+        existed; the domain fallback prevents duplicates, and our write stamps the
+        gid so they match directly next time).
 
-        Mirrors the HubSpot adapter: returns {grizz_id: record_id} for id matches
-        and {domain: record_id} for domain-only matches.
+        `grizz_id_field` (the legacy integer-id slug) is accepted for interface
+        compatibility but is no longer the primary match key.  The returned map is
+        keyed by what run_audience looks up — the legacy grizz_id value and the raw
+        domain — even though matching is gid-driven.
         """
         matched: dict[str, str] = {}
 
-        grizz_ids = [str(c["grizz_id"]) for c in companies if c.get("grizz_id")]
-        for batch in _chunks(grizz_ids, _QUERY_BATCH):
-            for rec in self._query({grizz_id_field: {"$in": batch}}):
-                gid = _first(rec.get("values", {}).get(grizz_id_field))
-                if gid:
-                    matched[str(gid)] = rec["id"]["record_id"]
+        def _keys(c: dict) -> list[str]:
+            ks = []
+            if c.get("grizz_id"):
+                ks.append(str(c["grizz_id"]))
+            if c.get("domain"):
+                ks.append(c["domain"])
+            return ks
 
-        matched_ids = set(matched)
-        unmatched_domains = [
-            _clean_domain(c["domain"]) for c in companies
-            if c.get("domain") and str(c.get("grizz_id", "")) not in matched_ids
-        ]
-        unmatched_domains = [d for d in unmatched_domains if d]
-        for batch in _chunks(unmatched_domains, _QUERY_BATCH):
+        # 1) primary: gid_company -> Attio grizz_gid
+        by_gid = {str(c["gid_company"]): c for c in companies if c.get("gid_company")}
+        gids_hit: set[str] = set()
+        for batch in _chunks(list(by_gid), _QUERY_BATCH):
+            for rec in self._query({_GID_SLUG: {"$in": batch}}):
+                recgid = _first(rec.get("values", {}).get(_GID_SLUG))
+                c = by_gid.get(str(recgid))
+                if c:
+                    gids_hit.add(str(recgid))
+                    for k in _keys(c):
+                        matched[k] = rec["id"]["record_id"]
+
+        # 2) fallback: native domains for companies not matched by gid
+        rem = [c for g, c in by_gid.items() if g not in gids_hit]
+        rem += [c for c in companies if not c.get("gid_company")]
+        dom_to_company = {
+            d: c for c in rem
+            if c.get("domain") and (d := _clean_domain(c["domain"]))
+        }
+        for batch in _chunks(list(dom_to_company), _QUERY_BATCH):
             ors = [{"domains": {"root_domain": d}} for d in batch]
             for rec in self._query({"$or": ors}):
                 for dom in rec.get("values", {}).get("domains", []):
-                    root = dom.get("root_domain")
-                    if root in batch:
-                        matched[root] = rec["id"]["record_id"]
+                    c = dom_to_company.get(dom.get("root_domain"))
+                    if c:
+                        for k in _keys(c):
+                            matched[k] = rec["id"]["record_id"]
         return matched
 
     # ── writes ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _shape(fields: dict) -> dict:
-        """Turn a mapped {slug: value} dict into an Attio `values` payload."""
+        """Turn a mapped {slug: value} dict into an Attio `values` payload, and
+        stamp grizz_last_sync = now so freshness/coverage tracks every write."""
         values: dict = {}
         for slug, value in fields.items():
             if slug == "Id":
@@ -204,10 +251,11 @@ class AttioAdapter(CRMAdapter):
                 values[slug] = value if isinstance(value, list) else [value]
             elif slug in _PHONE_SLUGS:
                 e164 = _to_e164(value)
-                if e164:                       # Attio rejects the record otherwise
+                if e164:                       # drop if not normalizable (Attio rejects malformed)
                     values[slug] = e164
             else:
                 values[slug] = value
+        values[_LAST_SYNC_SLUG] = datetime.now(timezone.utc).isoformat()
         return values
 
     @staticmethod
@@ -215,46 +263,63 @@ class AttioAdapter(CRMAdapter):
         resp = getattr(e, "response", None)
         return resp.text[:200] if resp is not None else f"{type(e).__name__}: {e}"
 
+    def _write(self, method: str, url: str, fields: dict) -> requests.Response:
+        """Shape + send a write. If Attio rejects a phone value (400), drop the
+        phone fields and retry once so every OTHER field on the record still
+        lands — a bad phone never costs the whole record."""
+        values = self._shape(fields)
+        resp = self._request(method, url, timeout=_WRITE_TIMEOUT, json={"data": {"values": values}})
+        if (resp.status_code == 400 and any(p in values for p in _PHONE_SLUGS)
+                and any(p in resp.text for p in _PHONE_SLUGS)):
+            for p in _PHONE_SLUGS:
+                values.pop(p, None)
+            resp = self._request(method, url, timeout=_WRITE_TIMEOUT, json={"data": {"values": values}})
+        resp.raise_for_status()
+        return resp
+
     def update_record(self, record_id: str, fields: dict) -> None:
         """Patch a single company record."""
-        resp = self._request(
-            "PATCH", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}",
-            timeout=_WRITE_TIMEOUT, json={"data": {"values": self._shape(fields)}},
+        resp = self._write(
+            "PATCH", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}", fields,
         )
         resp.raise_for_status()
 
+    def _parallel(self, records: list[dict], fn) -> list[dict]:
+        """Run a per-record write fn concurrently (Attio has no batch-write API),
+        preserving input order.  Each fn isolates its own errors, so the pool
+        never aborts on one bad record; transient 429/timeout backoff (in
+        _request) keeps the pool busy rather than failing fast."""
+        if not records:
+            return []
+        workers = min(_WRITE_CONCURRENCY, len(records))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(fn, records))
+
+    def _update_one(self, r: dict) -> dict:
+        record_id = r["Id"]
+        try:
+            self.update_record(record_id, r)
+            return {"id": record_id, "success": True, "errors": []}
+        except Exception as e:  # isolate ANY per-record failure, never abort the batch
+            return {"id": record_id, "success": False, "errors": [self._err(e)]}
+
+    def _create_one(self, r: dict) -> dict:
+        try:
+            resp = self._write("POST", f"{_BASE_URL}/v2/objects/{_OBJECT}/records", r)
+            new_id = resp.json().get("data", {}).get("id", {}).get("record_id", "")
+            return {"id": new_id, "success": True, "errors": []}
+        except Exception as e:  # isolate ANY per-record failure, never abort the batch
+            return {"id": "", "success": False, "errors": [self._err(e)]}
+
     def update_accounts(self, records: list[dict]) -> list[dict]:
-        """Update companies one record at a time (Attio has no batch write API).
+        """Update companies concurrently (Attio has no batch write API).
 
         Each record must include an 'Id' key.  Per-record failures (including
         timeouts/connection drops, after retries) are isolated — one bad record
-        never fails the rest of the batch.
+        never fails the rest.
         """
-        results: list[dict] = []
-        for r in records:
-            record_id = r["Id"]
-            try:
-                self.update_record(record_id, r)
-                results.append({"id": record_id, "success": True, "errors": []})
-            except requests.RequestException as e:
-                results.append({"id": record_id, "success": False, "errors": [self._err(e)]})
-        return results
+        return self._parallel(records, self._update_one)
 
     def create_accounts(self, records: list[dict]) -> list[dict]:
-        """Create companies one record at a time (Attio has no batch write API).
-
-        Per-record failures are isolated, same as update_accounts.
-        """
-        results: list[dict] = []
-        for r in records:
-            try:
-                resp = self._request(
-                    "POST", f"{_BASE_URL}/v2/objects/{_OBJECT}/records",
-                    timeout=_WRITE_TIMEOUT, json={"data": {"values": self._shape(r)}},
-                )
-                resp.raise_for_status()
-                new_id = resp.json().get("data", {}).get("id", {}).get("record_id", "")
-                results.append({"id": new_id, "success": True, "errors": []})
-            except requests.RequestException as e:
-                results.append({"id": "", "success": False, "errors": [self._err(e)]})
-        return results
+        """Create companies concurrently.  Per-record failures are isolated."""
+        return self._parallel(records, self._create_one)

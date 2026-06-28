@@ -16,6 +16,23 @@ This project uses [Semantic Versioning](https://semver.org/).
   and per-record errors are isolated (one bad record never aborts the rest). The
   write timeout was also raised from 15s to 60s (Attio writes can be slow under
   load).
+- Attio adapter now stamps `grizz_last_sync` on every write. It was dropped in the
+  headless→adapter conversion, so freshness/coverage counts never moved even though
+  the data synced.
+- Attio matching is now driven by `gid_company` (the canonical id, api.md §10),
+  with a native `domains` fallback for records that don't carry a gid yet — fixing
+  both the wrong driving key and the duplicate-creation risk for pre-gid records.
+- A 429 `Retry-After` returned as an HTTP-date (Attio's form) no longer crashes
+  with a `ValueError` that failed the whole batch — it's parsed as integer-seconds
+  OR HTTP-date, and capped.
+- A phone value Attio rejects (invalid for its phone-number type) no longer fails
+  the whole record — the phone is dropped and the write retried so every other
+  field still lands.
+
+### Performance
+- Attio writes run concurrently (Attio has no batch-write API), bounded to stay
+  under Attio's 25 writes/sec limit, with 429 backoff. Single records are still
+  seconds each server-side, so large tier syncs are best run as a background job.
 
 ### Changed
 - `audience` runs non-interactively when `--yes/-y` is passed or stdout/stdin is
