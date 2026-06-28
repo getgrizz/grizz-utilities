@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
-from grizz_enrichment import __version__
+from grizz_enrichment import __version__, grizz_client
 from grizz_enrichment.adapters import ADAPTERS
 from grizz_enrichment.audience_client import fetch_audience, submit as submit_audience
 from grizz_enrichment.grizz_client import enrich as grizz_enrich
@@ -326,6 +326,48 @@ def _save_audience_csv(audience_id: str, companies: list[dict]) -> Path:
     return out_path
 
 
+def _read_gids(path: Path) -> list[str]:
+    """Read gid_company values from a file: a CSV with a gid_company/gid column,
+    or a plain one-per-line list.  Grizz company gids start with 'GC'."""
+    import csv
+    rows = [r for r in csv.reader(path.read_text().splitlines()) if r and r[0].strip()]
+    if not rows:
+        return []
+    header = [h.strip().lower() for h in rows[0]]
+    col, start = 0, 0
+    for name in ("gid_company", "gid"):
+        if name in header:
+            col, start = header.index(name), 1
+            break
+    else:
+        # No recognized header — skip a stray header row if the first cell isn't a gid.
+        if not rows[0][col].strip().upper().startswith("GC"):
+            start = 1
+    return [r[col].strip() for r in rows[start:] if len(r) > col and r[col].strip()]
+
+
+def _companies_from_gids(api_key: str, gids: list[str]) -> list[dict]:
+    """Resolve gid_company values to Grizz company dicts via the read-only,
+    no-credit lookup-batch endpoint, normalized to the audience-result shape
+    that the downstream sync expects (hq_phone/hq_email -> phone/email)."""
+    companies: list[dict] = []
+    unmatched = 0
+    for i in range(0, len(gids), 5000):                      # lookup-batch caps at 5000
+        batch = gids[i:i + 5000]
+        for m in grizz_client.lookup_batch(api_key, [{"gid_company": g} for g in batch]):
+            company = m.get("company")
+            if not m.get("matched") or not company:
+                unmatched += 1
+                continue
+            c = dict(company)
+            c["phone"] = c.pop("hq_phone", "") or ""
+            c["email"] = c.pop("hq_email", "") or ""
+            companies.append(c)
+    if unmatched:
+        console.print(f"  [yellow]{unmatched} gid(s) not recognized by Grizz — skipped.[/yellow]")
+    return companies
+
+
 def run_audience(
     crm: str,
     config_path: Path,
@@ -333,8 +375,15 @@ def run_audience(
     audience_id: str | None = None,
     prompt: str | None = None,
     batch_size: int = 200,
+    gids: list[str] | None = None,
 ) -> None:
-    """Fetch an audience from Grizz and push unmatched companies into the CRM."""
+    """Push a Grizz company list into the CRM.
+
+    Source of the list is one of: an audience id, a prompt (builds a new
+    audience), or an explicit list of gid_company values (`gids`) — e.g. a
+    filtered selection handed off from the Grizz MCP.  Steps 2-5 (match,
+    update, create, report) are identical regardless of source.
+    """
 
     # ── Config ──────────────────────────────────────────────────────────────
     config = load_config(config_path)
@@ -354,41 +403,52 @@ def run_audience(
         )
         raise typer.Exit(1)
 
-    # ── Submit prompt if no audience_id given ────────────────────────────────
-    if not audience_id:
-        if not prompt:
-            console.print("[red]Provide --audience-id or --prompt.[/red]")
-            raise typer.Exit(1)
-        console.print(f"Submitting audience request...", end=" ")
+    # ── Resolve the company list (explicit gids, or an audience) ─────────────
+    if gids:
+        console.print(f"Resolving {len(gids)} companies from Grizz...", end=" ")
         try:
-            audience_id = submit_audience(grizz_api_key, prompt)
+            companies = _companies_from_gids(grizz_api_key, gids)
         except Exception as e:
-            console.print(f"\n[red]Failed to submit audience: {e}[/red]")
+            console.print(f"\n[red]Error resolving companies: {e}[/red]")
             raise typer.Exit(1)
-        console.print(f"[green]submitted.[/green] ID: [bold]{audience_id}[/bold]")
+        console.print(f"[green]{len(companies)} resolved.[/green]")
+        csv_label = "gid-selection"
+    else:
+        # Submit prompt if no audience_id given
+        if not audience_id:
+            if not prompt:
+                console.print("[red]Provide --audience-id, --prompt, or --gids.[/red]")
+                raise typer.Exit(1)
+            console.print(f"Submitting audience request...", end=" ")
+            try:
+                audience_id = submit_audience(grizz_api_key, prompt)
+            except Exception as e:
+                console.print(f"\n[red]Failed to submit audience: {e}[/red]")
+                raise typer.Exit(1)
+            console.print(f"[green]submitted.[/green] ID: [bold]{audience_id}[/bold]")
 
-    # ── Fetch / poll results ─────────────────────────────────────────────────
-    console.print(f"Fetching audience [bold]{audience_id}[/bold]...", end=" ")
-    try:
-        poll_count = [0]
+        console.print(f"Fetching audience [bold]{audience_id}[/bold]...", end=" ")
+        try:
+            poll_count = [0]
 
-        def on_status(s: str) -> None:
-            poll_count[0] += 1
-            console.print(f"  Polling ({poll_count[0]})... {s}", end="\r")
+            def on_status(s: str) -> None:
+                poll_count[0] += 1
+                console.print(f"  Polling ({poll_count[0]})... {s}", end="\r")
 
-        companies = fetch_audience(grizz_api_key, audience_id, on_status=on_status)
-        console.print(f"[green]{len(companies)} companies.[/green]")
-    except Exception as e:
-        console.print(f"\n[red]Error fetching audience: {e}[/red]")
-        raise typer.Exit(1)
+            companies = fetch_audience(grizz_api_key, audience_id, on_status=on_status)
+            console.print(f"[green]{len(companies)} companies.[/green]")
+        except Exception as e:
+            console.print(f"\n[red]Error fetching audience: {e}[/red]")
+            raise typer.Exit(1)
+        csv_label = audience_id
 
     if not companies:
-        console.print("[yellow]Audience returned no companies.[/yellow]")
+        console.print("[yellow]No companies to sync.[/yellow]")
         raise typer.Exit(0)
 
     # ── Save CSV immediately ─────────────────────────────────────────────────
     try:
-        csv_path = _save_audience_csv(audience_id, companies)
+        csv_path = _save_audience_csv(csv_label, companies)
         console.print(f"Saved to [bold]{csv_path}[/bold]")
     except Exception as e:
         console.print(f"[red]Could not save CSV: {e}[/red]")
@@ -605,19 +665,36 @@ def audience(
     crm: str = typer.Option("salesforce", help=f"CRM to use. Available: {', '.join(ADAPTERS)}"),
     audience_id: Optional[str] = typer.Option(None, "--audience-id", help="Existing Grizz audience ID"),
     prompt: Optional[str] = typer.Option(None, "--prompt", help="Prompt to create a new audience"),
+    gids: Optional[Path] = typer.Option(None, "--gids", help="File of gid_company values (one per line or a CSV with a gid_company column) — e.g. a filtered selection from the Grizz MCP"),
     config: Path = typer.Option(Path("config.yaml"), help="Path to your config.yaml"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing to CRM"),
     batch_size: int = typer.Option(200, "--batch-size", help="Records per API call when creating accounts (max 200)"),
 ):
-    """Fetch a Grizz audience, save to CSV, and push new companies into your CRM."""
+    """Push a Grizz company list (audience, prompt, or an explicit gid list) into your CRM."""
     if crm not in ADAPTERS:
         console.print(f"[red]Unknown CRM '{crm}'. Available: {', '.join(ADAPTERS)}[/red]")
         raise typer.Exit(1)
-    if not audience_id and not prompt:
-        console.print("[red]Provide --audience-id or --prompt.[/red]")
+    sources = sum(bool(x) for x in (audience_id, prompt, gids))
+    if sources == 0:
+        console.print("[red]Provide one of --audience-id, --prompt, or --gids.[/red]")
         raise typer.Exit(1)
+    if sources > 1:
+        console.print("[red]Provide only one of --audience-id, --prompt, or --gids.[/red]")
+        raise typer.Exit(1)
+
+    gid_list = None
+    if gids:
+        if not gids.exists():
+            console.print(f"[red]gids file not found: {gids}[/red]")
+            raise typer.Exit(1)
+        gid_list = _read_gids(gids)
+        if not gid_list:
+            console.print(f"[red]No gid_company values found in {gids}.[/red]")
+            raise typer.Exit(1)
+
     batch_size = max(1, min(batch_size, 200))
-    run_audience(crm, config, dry_run, audience_id=audience_id, prompt=prompt, batch_size=batch_size)
+    run_audience(crm, config, dry_run, audience_id=audience_id, prompt=prompt,
+                 batch_size=batch_size, gids=gid_list)
 
 
 @app.command()

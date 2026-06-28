@@ -10,6 +10,12 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `audience --gids <file>` — push an explicit list of `gid_company` values (one
+  per line, or a CSV with a `gid_company` column) instead of a whole audience.
+  Resolves the gids to full company data via the read-only, no-credit
+  lookup-batch endpoint, then runs the same match → update → create flow. Works
+  for every CRM. Intended for handing a filtered selection off from the Grizz MCP
+  (discover/refine in the MCP, load the bulk write here, out of model context).
 - **Attio support** as a first-class CRM adapter — it works the same way as the
   Salesforce/HubSpot adapters: same `setup` / `enrich` / `audience` commands, the
   same client-side `config.yaml` mapping, the same find-then-update/create flow,

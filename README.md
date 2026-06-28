@@ -145,7 +145,7 @@ python run.py enrich --crm hubspot --input companies.csv
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--dry-run` | Preview changes without writing to the CRM |
 
-**Fetch a Grizz audience and push to CRM:**
+**Push a Grizz company list to CRM:**
 
 ```bash
 # Use an existing audience
@@ -153,18 +153,31 @@ python run.py audience --crm salesforce --audience-id <uuid>
 
 # Or create a new audience from a prompt
 python run.py audience --crm hubspot --prompt "Mid-market US roofing contractors"
+
+# Or load an explicit list of companies (e.g. a filtered selection from the Grizz MCP)
+python run.py audience --crm attio --gids selection.csv
 ```
+
+Provide exactly one source: `--audience-id`, `--prompt`, or `--gids`.
 
 | Flag | Description |
 |---|---|
-| `--audience-id` | ID of an existing Grizz audience |
+| `--audience-id` | ID of an existing Grizz audience (loads the whole audience) |
 | `--prompt` | Natural language prompt to create a new audience |
+| `--gids` | File of `gid_company` values — one per line, or a CSV with a `gid_company` column — to load exactly that set |
 | `--crm` | CRM to use: `salesforce`, `hubspot`, or `attio` |
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--batch-size` | Records per API call when creating accounts (default: `200`, max: `200`) |
 | `--dry-run` | Preview changes without writing to the CRM |
 
-The audience command always saves a full copy of the audience to `csv_out/Audience <id>.csv` before touching your CRM. If any companies cannot be matched to an existing account by Grizz company ID or domain, you will be prompted before any new records are created.
+The command saves a full copy of the resolved companies to `csv_out/` before touching your CRM. If any companies cannot be matched to an existing account by Grizz company ID or domain, you will be prompted before any new records are created.
+
+**Filtered hand-off from the Grizz MCP.** Build and refine a company list in the
+Grizz MCP (e.g. "biggest 50 in New Jersey"), export the selected `gid_company`
+values to a CSV, and load exactly that set with `--gids`. Grizz resolves the gids
+to full company data (free, no credits), then runs the normal match → update →
+create flow — so discovery/refinement stays in the MCP and the bulk write runs
+here, out of any model context.
 
 ### CSV format
 
