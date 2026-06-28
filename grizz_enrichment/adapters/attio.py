@@ -111,6 +111,13 @@ class AttioAdapter(CRMAdapter):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         })
+        # Size the connection pool to the write concurrency, else threads above the
+        # default pool_maxsize (10) queue on connections and don't actually run in
+        # parallel.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=_WRITE_CONCURRENCY, pool_maxsize=_WRITE_CONCURRENCY,
+        )
+        self._session.mount("https://", adapter)
         resp = self._session.get(f"{_BASE_URL}/v2/self", timeout=_READ_TIMEOUT)
         if resp.status_code == 401:
             raise RuntimeError("ATTIO_API_KEY is invalid or lacks required scopes.")
