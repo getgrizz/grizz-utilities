@@ -166,8 +166,8 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool) -> 
             continue
 
         if grizz_data is None:
-            console.print(f"  [yellow]No match found in Grizz.[/yellow]")
-            summary.append((account_id, "no_match", domain))
+            console.print(f"  [yellow]No data available for this domain.[/yellow]")
+            summary.append((account_id, "no_data", domain))
             continue
 
         # 3. Map fields
@@ -202,7 +202,7 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool) -> 
     outcome_colors = {
         "success": "green",
         "dry_run": "cyan",
-        "no_match": "yellow",
+        "no_data": "yellow",
         "skipped": "yellow",
         "no_updates": "yellow",
         "error": "red",
@@ -370,7 +370,7 @@ def _companies_from_gids(api_key: str, gids: list[str]) -> list[dict]:
             c["email"] = c.pop("hq_email", "") or ""
             companies.append(c)
     if unmatched:
-        console.print(f"  [yellow]{unmatched} gid(s) not recognized by Grizz — skipped.[/yellow]")
+        console.print(f"  [yellow]{unmatched} compan(ies) returned no data — skipped.[/yellow]")
     return companies
 
 

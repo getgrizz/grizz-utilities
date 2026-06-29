@@ -528,8 +528,8 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
           "budget":      {budget snapshot from bulk endpoint},
         }
 
-    NOTE: companies that fall through to async scrape are polled here.
-    For larger batches the wall-clock time scales with the slowest scrape.
+    NOTE: companies still being enriched are polled here.
+    For larger batches the wall-clock time scales with the slowest enrichment.
     """
     body = submit_bulk(api_key, companies)
     initial_requests = body.get("results") or []
