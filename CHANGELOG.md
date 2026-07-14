@@ -10,6 +10,15 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `setup --object contacts` — provision the Grizz Contact fields on HubSpot /
+  Salesforce Contact records (the company setup is `--object company`, the
+  default). Ported from the MCP `setup_crm_contacts` tool with the identical
+  property set, so CLI setup and MCP setup produce the same portal — and since
+  `create-crm` writes these `grizz_contact_*` properties, they must exist before
+  `people sync` (a missing property makes contacts/batch/create 400). Uses the
+  same `HUBSPOT_API_KEY` / `SALESFORCE_*` env as the sync, so setup and sync
+  always target the same portal. The interactive menu now asks Company vs
+  Contact fields.
 - `people sync` command — enrich (optional) + push discovered contacts to the
   CRM via the same server-side `/people/create-crm/` endpoint the MCP uses, which
   matches each contact against its parent account's existing CRM contacts

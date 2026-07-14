@@ -33,6 +33,8 @@ from grizz_enrichment.mapper import apply_mapping
 from grizz_enrichment.setup_salesforce import run_setup as run_setup_salesforce
 from grizz_enrichment.setup_hubspot import run_setup as run_setup_hubspot
 from grizz_enrichment.setup_attio import run_setup as run_setup_attio
+from grizz_enrichment.setup_salesforce_contacts import run_setup as run_setup_salesforce_contacts
+from grizz_enrichment.setup_hubspot_contacts import run_setup as run_setup_hubspot_contacts
 
 load_dotenv(override=True)
 
@@ -1166,21 +1168,38 @@ def audience(
                  batch_size=batch_size, gids=gid_list, assume_yes=yes)
 
 
-@app.command()
-def setup(
-    crm: str = typer.Option("salesforce", help="CRM to set up"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without creating fields"),
-):
-    """Create all recommended Grizz custom fields in your CRM."""
+def _run_setup(crm: str, contacts: bool, dry_run: bool) -> None:
+    """Route to the company or contact setup for the chosen CRM.  The contact
+    setups provision exactly the grizz_contact_* properties create-crm writes —
+    identical to what the `setup_crm_contacts` MCP tool creates."""
     if crm == "salesforce":
-        run_setup_salesforce(dry_run=dry_run)
+        (run_setup_salesforce_contacts if contacts else run_setup_salesforce)(dry_run=dry_run)
     elif crm == "hubspot":
-        run_setup_hubspot(dry_run=dry_run)
+        (run_setup_hubspot_contacts if contacts else run_setup_hubspot)(dry_run=dry_run)
     elif crm == "attio":
-        run_setup_attio(dry_run=dry_run)   # fetches the catalog from Grizz, then provisions over the Attio API
+        # Attio provisions company + people attributes together from the Grizz
+        # catalog, so one setup run covers both objects.
+        if contacts:
+            console.print("[dim]Attio provisions company + contact attributes together — "
+                          "running the full catalog setup.[/dim]")
+        run_setup_attio(dry_run=dry_run)
     else:
         console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
         raise typer.Exit(1)
+
+
+@app.command()
+def setup(
+    crm: str = typer.Option("salesforce", help="CRM to set up"),
+    object_: str = typer.Option("company", "--object", help="Which records to set up: 'company' or 'contacts'"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without creating fields"),
+):
+    """Create all recommended Grizz custom fields in your CRM (company or contact records)."""
+    obj = object_.strip().lower()
+    if obj not in ("company", "companies", "contact", "contacts"):
+        console.print(f"[red]--object must be 'company' or 'contacts' (got '{object_}').[/red]")
+        raise typer.Exit(1)
+    _run_setup(crm, contacts=obj in ("contact", "contacts"), dry_run=dry_run)
 
 
 @app.callback(invoke_without_command=True)
@@ -1212,19 +1231,19 @@ def main(ctx: typer.Context) -> None:
         if not crm:
             raise typer.Exit(0)
 
+        which = questionary.select(
+            "Which records?",
+            choices=["Company / Account fields", "Contact fields"],
+        ).ask()
+        if not which:
+            raise typer.Exit(0)
+
         dry_run = questionary.confirm(
             "Dry run (preview without creating fields)?",
             default=False,
         ).ask()
         console.print()
-        if crm == "salesforce":
-            run_setup_salesforce(dry_run=bool(dry_run))
-        elif crm == "hubspot":
-            run_setup_hubspot(dry_run=bool(dry_run))
-        elif crm == "attio":
-            run_setup_attio(dry_run=bool(dry_run))
-        else:
-            console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
+        _run_setup(crm, contacts=(which == "Contact fields"), dry_run=bool(dry_run))
         return
 
     if action == "Enrich accounts from CSV":
