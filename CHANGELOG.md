@@ -10,6 +10,17 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `people sync` command — enrich (optional) + push discovered contacts to the
+  CRM via the same server-side `/people/create-crm/` endpoint the MCP uses, which
+  matches each contact against its parent account's existing CRM contacts
+  (gid_person → email → linkedin → name) and UPDATES in place rather than
+  duplicating. Takes a `people discover` `contacts.json` (or a CSV/txt of person
+  gids), packages the customer CRM key from `.env` into the request-body
+  `credentials` (`HUBSPOT_API_KEY` → `hubspot_key`; `SALESFORCE_SESSION_ID` +
+  `SALESFORCE_INSTANCE_URL`), batches at 100, polls each write to completion, and
+  reports created/updated/no_grizz_match/no_parent_match/parent_linked/errors.
+  `--enrich-email`/`--enrich-phone` (off by default) spend credits; `--dry-run`
+  resolves + counts without writing.
 - `people discover` command — local path for contact (people) discovery over a
   company list, so discovery no longer has to run through MCP/chat (which timed
   out on large batches). Takes a CSV (`record_id` + `gid_company` and/or

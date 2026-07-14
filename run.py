@@ -945,6 +945,173 @@ def people_discover(
                         batch_size, poll_interval, poll_timeout, resume)
 
 
+# ── People sync (enrich + push contacts to CRM) ─────────────────────────────────
+
+def _crm_contact_credentials(crm: str) -> dict:
+    """Gather the customer-CRM credentials the server-side contact endpoints
+    expect (they ride in the request body, not the auth header — that's the
+    Grizz API key).  Sourced from the same env vars the CRM adapters use."""
+    if crm == "hubspot":
+        token = os.environ.get("HUBSPOT_API_KEY")
+        if not token:
+            console.print("[red]HUBSPOT_API_KEY is not set.[/red] "
+                          "Add your HubSpot private-app token to [bold].env[/bold].")
+            raise typer.Exit(1)
+        return {"hubspot_key": token}
+    if crm == "salesforce":
+        inst = os.environ.get("SALESFORCE_INSTANCE_URL")
+        sess = os.environ.get("SALESFORCE_SESSION_ID")
+        if not (inst and sess):
+            console.print("[red]SALESFORCE_INSTANCE_URL and SALESFORCE_SESSION_ID must be set "
+                          "in [bold].env[/bold] for contact sync.[/red]")
+            raise typer.Exit(1)
+        return {"sf_instance_url": inst, "sf_session_id": sess}
+    console.print(f"[red]Contact sync is not supported for CRM '{crm}'.[/red]")
+    raise typer.Exit(1)
+
+
+def _read_person_gids(path: Path) -> list[str]:
+    """Read Grizz person gids from a `people discover` contacts.json, a CSV with
+    a gid/gid_person column, or a plain one-gid-per-line file."""
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        gids = [(c.get("gid") or c.get("gid_person") or "").strip()
+                for c in data if isinstance(c, dict)]
+        return [g for g in gids if g]
+    rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
+    if not rows:
+        return []
+    header = [h.strip().lower() for h in rows[0]]
+    gid_keys = ("gid", "gid_person", "person_gid")
+    if any(h in gid_keys for h in header):
+        idx = next(i for i, h in enumerate(header) if h in gid_keys)
+        return [r[idx].strip() for r in rows[1:] if len(r) > idx and r[idx].strip()]
+    return [r[0].strip() for r in rows if r and r[0].strip()]
+
+
+def _poll_until_terminal(fn, poll_interval: int, poll_timeout: int,
+                         terminal=("COMPLETE", "FAILED")) -> dict | None:
+    """Poll a status-returning callable until it reaches a terminal status or
+    the timeout elapses.  Returns the last response (or None on immediate error)."""
+    waited = 0
+    try:
+        resp = fn()
+    except Exception as e:
+        console.print(f"[yellow](poll error: {e})[/yellow]", end=" ")
+        resp = None
+    while (resp or {}).get("status") not in terminal and waited < poll_timeout:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        try:
+            resp = fn()
+        except Exception as e:
+            console.print(f"[yellow](poll error: {e})[/yellow]", end=" ")
+    return resp
+
+
+def run_people_sync(crm: str, contacts_path: Path, enrich_email: bool, enrich_phone: bool,
+                    poll_interval: int, poll_timeout: int, dry_run: bool) -> None:
+    """Enrich (optional) + push discovered contacts to the CRM via the same
+    server-side create-crm endpoint the MCP uses — which matches each contact
+    against its parent account's existing CRM contacts and UPDATES in place
+    rather than duplicating (create-or-update)."""
+    api_key = os.environ.get("GRIZZ_API_KEY")
+    if not api_key:
+        console.print("[red]GRIZZ_API_KEY is not set.[/red] Add it to your [bold].env[/bold] file.")
+        raise typer.Exit(1)
+    crm = crm.strip().lower()
+    credentials = _crm_contact_credentials(crm)   # validates env before any work
+
+    gids = list(dict.fromkeys(_read_person_gids(contacts_path)))  # de-dup, keep order
+    if not gids:
+        console.print(f"[red]No person gids found in {contacts_path}.[/red]")
+        raise typer.Exit(1)
+    src = "HUBSPOT_API_KEY" if crm == "hubspot" else "SALESFORCE_SESSION_ID/INSTANCE_URL"
+    console.print(f"Loaded [bold]{len(gids)}[/bold] contact(s) from {contacts_path}; "
+                  f"CRM=[bold]{crm}[/bold] (creds from {src}).")
+
+    # ── optional enrichment (spends credits) ─────────────────────────────────
+    if enrich_email or enrich_phone:
+        want = ", ".join(f for f, on in (("email", enrich_email), ("phone", enrich_phone)) if on)
+        console.print(f"Enriching [bold]{want}[/bold] for {len(gids)} contact(s) "
+                      f"(spends credits)...", end=" ")
+        sub = grizz_client.enrich_contacts_batch(api_key, gids,
+                                                 include_email=enrich_email,
+                                                 include_phone=enrich_phone)
+        rid = sub.get("request_id")
+        final = _poll_until_terminal(
+            lambda: grizz_client.check_person_enrich_batch(api_key, rid),
+            poll_interval, poll_timeout)
+        if not final or final.get("status") != "COMPLETE":
+            console.print(f"[yellow]{(final or {}).get('status', 'timeout')} — "
+                          f"syncing whatever entitlements exist anyway.[/yellow]")
+        else:
+            console.print(f"[green]done[/green] — found_email={final.get('found_email')} "
+                          f"found_phone={final.get('found_phone')}")
+
+    records = [{"gid_person": g} for g in gids]
+    if dry_run:
+        console.print(f"[yellow]Dry run — {len(records)} record(s) resolved; "
+                      f"not writing to {crm}.[/yellow]")
+        return
+
+    # ── push in batches (server dedups + creates/updates per account) ────────
+    BATCH = 100
+    agg = {k: 0 for k in ("created", "updated", "no_grizz_match",
+                          "no_parent_match", "parent_linked", "errors")}
+    n_batches = (len(records) + BATCH - 1) // BATCH
+    for bi in range(0, len(records), BATCH):
+        chunk = records[bi:bi + BATCH]
+        n = bi // BATCH + 1
+        console.print(f"[{n}/{n_batches}] pushing {len(chunk)} contact(s)...", end=" ")
+        sub = grizz_client.create_in_crm_contacts(api_key, crm, credentials, chunk)
+        rid = sub.get("request_id")
+        final = _poll_until_terminal(
+            lambda: grizz_client.check_crm_write_request(api_key, rid),
+            poll_interval, poll_timeout)
+        if not final or final.get("status") != "COMPLETE":
+            console.print(f"[red]{(final or {}).get('status', 'timeout')}[/red] "
+                          f"{(final or {}).get('error_message', '')}")
+            agg["errors"] += len(chunk)
+            continue
+        for k in agg:
+            agg[k] += final.get(k, 0) or 0
+        console.print(f"[green]created={final.get('created', 0)} "
+                      f"updated={final.get('updated', 0)}[/green]")
+
+    console.print(f"\n[bold green]Done.[/bold green] "
+                  f"created={agg['created']}  updated={agg['updated']}  "
+                  f"no_grizz_match={agg['no_grizz_match']}  "
+                  f"no_parent_match={agg['no_parent_match']}  "
+                  f"parent_linked={agg['parent_linked']}  errors={agg['errors']}")
+
+
+@people_app.command("sync")
+def people_sync(
+    crm: str = typer.Option(..., "--crm", help="hubspot or salesforce"),
+    contacts: Path = typer.Option(..., "--contacts", help="contacts.json from `people discover`, or a CSV/txt of person gids"),
+    enrich_email: bool = typer.Option(False, "--enrich-email", help="Enrich work email before sync (spends credits)"),
+    enrich_phone: bool = typer.Option(False, "--enrich-phone", help="Enrich phone before sync (spends credits)"),
+    poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
+    poll_timeout: int = typer.Option(600, "--poll-timeout", help="Max seconds to wait per job."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),
+):
+    """Push discovered contacts to your CRM — server-side create-OR-update.
+
+    Each contact is matched against its parent account's existing CRM contacts
+    (gid_person → email → linkedin → name) and updated in place when found,
+    created otherwise — so a re-sync or an email-less existing contact isn't
+    duplicated.  The CRM key rides in the request body as `credentials` (from
+    .env); only the Grizz key is a Bearer header.  Discovery is free; email/phone
+    enrichment (--enrich-email/--enrich-phone) is a separate, paid step.
+    """
+    if not contacts.exists():
+        console.print(f"[red]Contacts file not found: {contacts}[/red]")
+        raise typer.Exit(1)
+    run_people_sync(crm, contacts, enrich_email, enrich_phone,
+                    poll_interval, poll_timeout, dry_run)
+
+
 @app.command()
 def enrich(
     crm: str = typer.Option(..., help=f"CRM to use. Available: {', '.join(ADAPTERS)}"),
