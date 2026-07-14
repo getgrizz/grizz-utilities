@@ -10,6 +10,16 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- HubSpot setup: dropped `hasUniqueValue` from the `grizz_company_id` company
+  property (and the "Unique" wording in its description). HubSpot enforces
+  `hasUniqueValue` at write time, but client CRMs hold duplicate company records
+  that legitimately resolve to one Grizz company, so many records share a
+  `grizz_company_id`. The unique constraint 409'd every write after the first in
+  a duplicate cluster and — because record writes are atomic — that failure also
+  blocked the record's other `grizz_*` fields, breaking enrichment of exactly the
+  duplicate population we care about. Uniqueness isn't needed for matching.
+  (Salesforce uses `externalId` without a `unique` flag and Attio creates every
+  attribute `is_unique=False`, so neither is affected.)
 - Attio adapter resilience: a read timeout or connection drop on a single write no
   longer fails the whole batch. Writes (and reads) now retry transient failures —
   timeout, connection drop, 429 (honoring Retry-After), and 5xx — with backoff,

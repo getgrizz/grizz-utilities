@@ -20,8 +20,15 @@ GRIZZ_PROPERTIES = [
         "type":        "string",
         "fieldType":   "text",
         "groupName":   "grizz",
-        "description": "Unique Grizz company identifier.",
-        "hasUniqueValue": True,
+        # NOT hasUniqueValue: client CRMs hold duplicate company records that
+        # legitimately resolve to one Grizz company, so many records share a
+        # grizz_company_id. HubSpot enforces hasUniqueValue at write time, so a
+        # unique constraint 409s every write after the first in a duplicate
+        # cluster — and because record writes are atomic, that also blocks the
+        # record's other grizz_* fields, breaking enrichment of exactly the
+        # duplicate population we care about. Uniqueness isn't needed to match
+        # (search works regardless).
+        "description": "Grizz company identifier.",
     },
     {
         "name":        "grizz_gid",
