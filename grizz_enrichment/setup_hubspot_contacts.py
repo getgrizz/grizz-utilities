@@ -23,7 +23,14 @@ GRIZZ_PROPERTIES = [
         "fieldType":     "text",
         "groupName":     "grizz_contacts",
         "description":   "Grizz Contact ID. Used to dedup contacts on subsequent syncs.",
-        "hasUniqueValue": True,
+        # NOT hasUniqueValue: customer CRMs hold duplicate contact records that
+        # legitimately resolve to one Grizz person (exactly the population dedup
+        # targets), so several contacts can share one grizz_contact_provider_id.
+        # HubSpot enforces hasUniqueValue at write time, so a unique constraint
+        # 409s every write after the first in a duplicate cluster — and because
+        # record writes are atomic, that also blocks the record's other grizz_*
+        # fields. Same failure mode as the company grizz_company_id fix
+        # (GRIZZ-135). Uniqueness isn't needed to match (search works regardless).
     },
     {
         "name":      "grizz_contact_linkedin_url",
