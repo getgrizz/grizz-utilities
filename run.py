@@ -11,8 +11,10 @@ Headless usage:
 """
 
 import csv
+import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,13 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 console = Console()
+
+people_app = typer.Typer(
+    help="People discovery + contact enrichment flows (contacts, not companies).",
+    add_completion=False,
+    no_args_is_help=True,
+)
+app.add_typer(people_app, name="people")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -663,6 +672,278 @@ def run_audience(
 
 
 # ── CLI commands ───────────────────────────────────────────────────────────────
+
+# ── People discovery ────────────────────────────────────────────────────────────
+
+_DISCOVERY_PROMPT = "give me relevant contacts on these accounts"
+
+# Input-CSV column aliases (matched case/space/underscore-insensitively).
+_DISCOVERY_COL_ALIASES = {
+    "record_id":     ("record_id", "id", "account id", "crm_record_id", "crm id"),
+    "name":          ("name", "company_name", "crm_name", "account name", "company"),
+    "gid_company":   ("gid_company", "gid", "grizz_company_gid", "company_gid"),
+    "domain":        ("domain", "grizz_domain", "website", "company_domain"),
+    "domain_source": ("domain_source",),
+}
+
+_DISCOVERY_CSV_FIELDS = [
+    "gid", "first_name", "last_name", "title", "persona", "seniority",
+    "department", "company", "company_gid", "crm_company_record_id",
+    "crm_name", "company_domain", "city", "state", "country",
+    "linkedin_url", "fallback", "email_entitled", "phone_entitled",
+]
+
+
+def _norm_header(h: str) -> str:
+    return (h or "").strip().lower().replace("-", " ").replace("_", " ")
+
+
+def _read_discovery_rows(path: Path) -> list[dict]:
+    """Read the discovery input CSV into normalized rows.  Each row carries
+    record_id (required) plus a gid_company and/or domain to key discovery on."""
+    with open(path, newline="", encoding="utf-8") as f:
+        raw = list(csv.DictReader(f))
+    if not raw:
+        console.print("[red]Input CSV is empty.[/red]")
+        raise typer.Exit(1)
+
+    headers = list(raw[0].keys())
+    norm = {h: _norm_header(h) for h in headers}
+
+    def find(canon: str) -> Optional[str]:
+        wants = {_norm_header(a) for a in _DISCOVERY_COL_ALIASES[canon]}
+        return next((h for h in headers if norm[h] in wants), None)
+
+    cols = {c: find(c) for c in _DISCOVERY_COL_ALIASES}
+    if not cols["record_id"]:
+        console.print("[red]Input CSV needs a record_id column "
+                      "(aliases: id, account id, crm_record_id).[/red]")
+        raise typer.Exit(1)
+    if not cols["gid_company"] and not cols["domain"]:
+        console.print("[red]Input CSV needs a gid_company or domain column.[/red]")
+        raise typer.Exit(1)
+
+    def cell(r: dict, c: str) -> str:
+        return (r.get(cols[c]) or "").strip() if cols[c] else ""
+
+    rows = []
+    for r in raw:
+        rid = cell(r, "record_id")
+        if not rid:
+            continue
+        rows.append({
+            "record_id": rid,
+            "name": cell(r, "name"),
+            "gid_company": cell(r, "gid_company"),
+            "domain": cell(r, "domain"),
+            "domain_source": cell(r, "domain_source"),
+        })
+    return rows
+
+
+def _resolve_gids(api_key: str, rows: list[dict]) -> tuple[int, list[dict]]:
+    """Fill gid_company for rows that only have a domain, via a free cascade
+    lookup — so every company keys on a Grizz company and round-trips cleanly
+    (this also collapses franchise/redirect domains onto the canonical company).
+    Mutates rows in place; returns (resolved_count, still_unresolved_rows)."""
+    need = [r for r in rows if not r["gid_company"] and r["domain"]]
+    if not need:
+        return 0, []
+    resolved = 0
+    for i in range(0, len(need), 5000):
+        chunk = need[i:i + 5000]
+        matches = grizz_client.lookup_batch(
+            api_key, [{"domain": r["domain"]} for r in chunk])
+        by_domain = {}
+        for m in matches:
+            d = ((m or {}).get("input") or {}).get("domain")
+            if d:
+                by_domain[d.lower()] = m
+        for r in chunk:
+            comp = (by_domain.get(r["domain"].lower()) or {}).get("company") or {}
+            gid = comp.get("gid_company")
+            if gid:
+                r["gid_company"] = gid
+                if not r["name"]:
+                    r["name"] = comp.get("company_name") or ""
+                if not r["domain_source"]:
+                    r["domain_source"] = "grizz"
+                resolved += 1
+    return resolved, [r for r in need if not r["gid_company"]]
+
+
+def _fetch_all_members(api_key: str, audience_id: str, per_page: int = 200) -> list[dict]:
+    """Page through every member of a completed people audience."""
+    out: list[dict] = []
+    page = 1
+    while True:
+        resp = grizz_client.get_people_audience_members(
+            api_key, audience_id, page=page, per_page=per_page)
+        results = resp.get("results")
+        if not results:
+            break
+        out.extend(results)
+        if len(out) >= resp.get("total", len(out)):
+            break
+        page += 1
+    return out
+
+
+def _write_discovery_csv(path: Path, contacts: list[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_DISCOVERY_CSV_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for c in contacts:
+            w.writerow(c)
+
+
+def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
+                        max_per_company: int, batch_size: int,
+                        poll_interval: int, poll_timeout: int, resume: bool) -> None:
+    """Discover contacts for a company list and emit the JSON files
+    log_people_batch.py ingests (contacts.json + checked.json) + a review CSV.
+    Discovery is free — no email/phone is fetched and no credits are spent."""
+    api_key = os.environ.get("GRIZZ_API_KEY")
+    if not api_key:
+        console.print("[red]GRIZZ_API_KEY is not set.[/red] Add it to your [bold].env[/bold] file.")
+        raise typer.Exit(1)
+
+    rows = _read_discovery_rows(input_file)
+    console.print(f"Loaded [bold]{len(rows)}[/bold] company row(s) from {input_file}.")
+
+    resolved, unresolved = _resolve_gids(api_key, rows)
+    if resolved:
+        console.print(f"Resolved [bold]{resolved}[/bold] domain-only row(s) to a Grizz company.")
+    if unresolved:
+        console.print(f"[yellow]{len(unresolved)} row(s) have no gid and no resolvable domain — "
+                      f"recorded as checked with 0 contacts.[/yellow]")
+
+    # gid -> input rows (duplicate CRM records can resolve to one company)
+    by_gid: dict[str, list[dict]] = {}
+    for r in rows:
+        if r["gid_company"]:
+            by_gid.setdefault(r["gid_company"], []).append(r)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    contacts_path = out_dir / "contacts.json"
+    checked_path = out_dir / "checked.json"
+    csv_path = out_dir / "contacts_review.csv"
+    state_path = out_dir / "discover_progress.json"
+
+    done_gids: set[str] = set()
+    contacts: list[dict] = []
+    if resume and state_path.exists():
+        done_gids = set(json.loads(state_path.read_text()).get("done_gids", []))
+        if contacts_path.exists():
+            contacts = json.loads(contacts_path.read_text())
+        console.print(f"[cyan]Resuming — {len(done_gids)} compan(ies) already discovered.[/cyan]")
+
+    remaining = [g for g in by_gid if g not in done_gids]
+    console.print(f"Discovering contacts for [bold]{len(remaining)}[/bold] compan(ies) "
+                  f"in batches of {batch_size}.\n")
+
+    unmapped = 0
+    failed_batches = 0
+    total_batches = (len(remaining) + batch_size - 1) // batch_size
+    for bi in range(0, len(remaining), batch_size):
+        batch = remaining[bi:bi + batch_size]
+        n = bi // batch_size + 1
+        console.print(f"[{n}/{total_batches}] audience for {len(batch)} compan(ies)...", end=" ")
+        try:
+            aud = grizz_client.create_people_audience(
+                api_key, prompt=prompt, company_gids=batch,
+                max_per_company=max_per_company)
+        except Exception as e:
+            console.print(f"[red]create failed: {e}[/red]")
+            failed_batches += 1
+            continue
+
+        aid = aud.get("id")
+        status = aud.get("status")
+        waited = 0
+        while status not in ("COMPLETE", "FAILED") and waited < poll_timeout:
+            time.sleep(poll_interval)
+            waited += poll_interval
+            try:
+                status = grizz_client.get_people_audience(api_key, aid).get("status")
+            except Exception as e:
+                console.print(f"[yellow](poll error: {e})[/yellow]", end=" ")
+
+        if status != "COMPLETE":
+            console.print(f"[red]status={status} after {waited}s — retry with --resume.[/red]")
+            failed_batches += 1
+            continue
+
+        batch_contacts = 0
+        for m in _fetch_all_members(api_key, aid):
+            owners = by_gid.get(m.get("company_gid"))
+            if not owners:
+                unmapped += 1
+                continue
+            owner = owners[0]  # attribute to the first CRM record when duplicates share a gid
+            row = dict(m)
+            row["crm_company_record_id"] = owner["record_id"]
+            row["crm_name"] = owner["name"] or m.get("company") or ""
+            row["company_domain"] = owner["domain"] or ""
+            contacts.append(row)
+            batch_contacts += 1
+
+        done_gids.update(batch)
+        console.print(f"[green]COMPLETE[/green] — {batch_contacts} contact(s).")
+        # persist after every batch so the run is crash-safe / resumable
+        contacts_path.write_text(json.dumps(contacts, indent=2))
+        state_path.write_text(json.dumps({"done_gids": sorted(done_gids)}, indent=2))
+
+    # checked.json — one roster row per input company (found or not)
+    checked = [{
+        "record_id": r["record_id"],
+        "company_name": r["name"],
+        "domain_used": r["domain"],
+        "domain_source": r["domain_source"] or ("grizz" if r["gid_company"] else ""),
+    } for r in rows]
+    checked_path.write_text(json.dumps(checked, indent=2))
+    _write_discovery_csv(csv_path, contacts)
+
+    console.print()
+    console.print(f"[bold green]Done.[/bold green] {len(contacts)} contact(s) across "
+                  f"{len(done_gids)} compan(ies); {len(checked)} companies recorded as checked.")
+    if unmapped:
+        console.print(f"[yellow]{unmapped} contact(s) resolved to a company_gid not in the input "
+                      f"(parent/dedup) — dropped as unattributable.[/yellow]")
+    if failed_batches:
+        console.print(f"[yellow]{failed_batches} batch(es) failed/timed out — re-run with --resume.[/yellow]")
+    console.print(f"\nWrote:\n  {contacts_path}  (per-contact, keyed to each CRM record)"
+                  f"\n  {checked_path}   (coverage roster — every company checked, found or not)"
+                  f"\n  {csv_path}  (human review)")
+    console.print("\ncontacts.json + checked.json are the discovery hand-off; feed them to "
+                  "your contact-log loader before the paid email/phone enrich step.")
+
+
+@people_app.command("discover")
+def people_discover(
+    input: Path = typer.Option(..., "--input", help="CSV of companies. Needs a record_id column plus gid_company and/or domain."),
+    out_dir: Path = typer.Option(Path("people_out"), "--out-dir", help="Directory for contacts.json + checked.json + review CSV."),
+    prompt: str = typer.Option(_DISCOVERY_PROMPT, "--prompt", help="Discovery prompt (the org's saved ICP personas expand it server-side)."),
+    max_per_company: int = typer.Option(3, "--max-per-company", help="Max contacts per company."),
+    batch_size: int = typer.Option(50, "--batch-size", help="Companies per audience (<=50 recommended)."),
+    poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
+    poll_timeout: int = typer.Option(600, "--poll-timeout", help="Max seconds to wait per batch before skipping (retry with --resume)."),
+    resume: bool = typer.Option(False, "--resume", help="Skip companies already discovered in a prior run (reads out-dir progress)."),
+):
+    """Discover contacts (people) for a company list — free; no credits spent.
+
+    Keys discovery on each company's Grizz gid_company (domain-only rows are
+    resolved to one first).  Emits the two JSON files log_people_batch.py
+    ingests (contacts.json + checked.json) plus a review CSV.  Finding people
+    is free; email/phone enrichment is a separate, paid step.
+    """
+    if not input.exists():
+        console.print(f"[red]Input file not found: {input}[/red]")
+        raise typer.Exit(1)
+    batch_size = max(1, min(batch_size, 200))
+    run_people_discover(input, out_dir, prompt, max_per_company,
+                        batch_size, poll_interval, poll_timeout, resume)
+
 
 @app.command()
 def enrich(

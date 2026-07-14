@@ -9,6 +9,22 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `people discover` command — local path for contact (people) discovery over a
+  company list, so discovery no longer has to run through MCP/chat (which timed
+  out on large batches). Takes a CSV (`record_id` + `gid_company` and/or
+  `domain`), keys discovery on each company's Grizz `gid_company` (domain-only
+  rows are resolved to one first via a free cascade lookup, which also collapses
+  franchise/redirect domains onto the canonical company), batches into people
+  audiences (default 50/batch), polls to completion, and pages members back.
+  Emits `contacts.json` (each contact joined back to its CRM `record_id`) +
+  `checked.json` (a coverage roster of every company checked, found or not) plus
+  a review CSV. Resumable (`--resume`) and persists after each batch. Discovery
+  is free — email/phone enrichment stays a separate, paid step.
+- `grizz_client`: `create_people_audience`, `get_people_audience`, and
+  `get_people_audience_members` wrap the `/api/v1/people/audiences/` submit →
+  poll → members cycle (pair of the `build_people_audience` MCP tool).
+
 ### Fixed
 - HubSpot setup: dropped `hasUniqueValue` from the `grizz_company_id` company
   property (and the "Unique" wording in its description). HubSpot enforces

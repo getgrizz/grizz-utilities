@@ -384,6 +384,89 @@ def check_person_enrich_batch(api_key: str, request_id: str) -> dict:
     return resp.json()
 
 
+def create_people_audience(
+    api_key: str,
+    prompt: str | None = None,
+    titles: list[str] | None = None,
+    domains: list[str] | None = None,
+    company_gids: list[str] | None = None,
+    source_audience_id: str | None = None,
+    named_contacts: list[dict] | None = None,
+    max_per_company: int = 3,
+) -> dict:
+    """Pair of the `build_people_audience` MCP tool — start a people-discovery
+    build over a company list and get back an audience id to poll.
+
+    Wraps POST /api/v1/people/audiences/.  Supply the company set exactly one
+    way — `company_gids` (preferred: a Grizz-resolved company is the most
+    precise key and round-trips cleanly to your rows), `domains`, or an
+    existing `source_audience_id`.  Discovery itself is free; the returned
+    persons carry no email/phone until you enrich them.
+
+    The server resolves each company, plans personas from `prompt`/`titles`
+    (or the org's saved ICP when the prompt is vague), and returns 202 with
+    {id, status, prompt, titles} immediately.  The build runs async — poll
+    `get_people_audience(id)` until status == "COMPLETE", then page
+    `get_people_audience_members(id)`.
+    """
+    payload: dict = {"max_per_company": max_per_company}
+    if prompt:
+        payload["prompt"] = prompt
+    if titles:
+        payload["titles"] = titles
+    if domains:
+        payload["domains"] = domains
+    if company_gids:
+        payload["company_gids"] = company_gids
+    if source_audience_id:
+        payload["source_audience_id"] = source_audience_id
+    if named_contacts:
+        payload["named_contacts"] = named_contacts
+    url = f"{BASE_URL}/api/v1/people/audiences/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
+    _raise_with_body(resp)
+    return resp.json()
+
+
+def get_people_audience(api_key: str, audience_id: str) -> dict:
+    """Poll a people audience's status/summary.
+
+    Wraps GET /api/v1/people/audiences/<id>/.  Returns
+    {id, status, name, prompt, titles, result_count, max_per_company,
+     source_audience_id, created_at, completed_at}.  status is one of
+    PENDING | RUNNING | COMPLETE | FAILED.
+    """
+    url = f"{BASE_URL}/api/v1/people/audiences/{audience_id}/"
+    resp = requests.get(url, headers=_headers(api_key), timeout=30)
+    _raise_with_body(resp)
+    return resp.json()
+
+
+def get_people_audience_members(
+    api_key: str,
+    audience_id: str,
+    page: int = 1,
+    per_page: int = 200,
+) -> dict:
+    """One page of the persons a completed people audience discovered.
+
+    Wraps GET /api/v1/people/audiences/<id>/members/.  Until the build is
+    COMPLETE this returns 202 with {detail, status} and no `results` key, so
+    callers should poll `get_people_audience` first.  On COMPLETE returns
+    {audience_id, total, page, per_page, results}, where each result is
+    {gid, first_name, last_name, title, persona, seniority, department,
+     company, company_gid, city, state, country, linkedin_url, email, phone,
+     email_entitled, phone_entitled, fallback}.  `fallback=True` means no
+     persona matched at that company and Grizz cascaded to the most senior
+     ICP-department person it could find.
+    """
+    url = f"{BASE_URL}/api/v1/people/audiences/{audience_id}/members/"
+    resp = requests.get(url, params={"page": page, "per_page": per_page},
+                        headers=_headers(api_key), timeout=60)
+    _raise_with_body(resp)
+    return resp.json()
+
+
 def update_crm_contacts(
     api_key: str,
     crm: str,
