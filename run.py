@@ -1011,8 +1011,66 @@ def _poll_until_terminal(fn, poll_interval: int, poll_timeout: int,
     return resp
 
 
+def _run_enrich(api_key: str, gids: list[str], enrich_email: bool, enrich_phone: bool,
+                batch_size: int, poll_interval: int, poll_timeout: int) -> None:
+    """Enrich email/phone in chunks, polling each chunk to FULL completion.
+
+    Never reports a chunk as done while contacts are still pending — a mid-flight
+    enrich that printed "done" is exactly what tempted the re-runs that
+    double-charged phone credits.  On a chunk that doesn't settle in the poll
+    window it says so plainly and tells you to re-run (re-enriching an
+    already-entitled contact is free)."""
+    want = ", ".join(f for f, on in (("email", enrich_email), ("phone", enrich_phone)) if on)
+    n_batches = (len(gids) + batch_size - 1) // batch_size
+    console.print(f"Enriching [bold]{want}[/bold] for {len(gids)} contact(s) in "
+                  f"{n_batches} chunk(s) of {batch_size} (spends credits).")
+
+    tot = {"found_email": 0, "found_phone": 0, "failed": 0, "pending": 0}
+    incomplete = 0
+    for bi in range(0, len(gids), batch_size):
+        chunk = gids[bi:bi + batch_size]
+        n = bi // batch_size + 1
+        console.print(f"[{n}/{n_batches}] enriching {len(chunk)}...", end=" ")
+        sub = grizz_client.enrich_contacts_batch(api_key, chunk,
+                                                 include_email=enrich_email,
+                                                 include_phone=enrich_phone)
+        final = _poll_until_terminal(
+            lambda: grizz_client.check_person_enrich_batch(api_key, sub.get("request_id")),
+            poll_interval, poll_timeout) or {}
+        fe = final.get("found_email", 0) or 0
+        fp = final.get("found_phone", 0) or 0
+        failed = final.get("failed", 0) or 0
+        pending = final.get("pending", 0) or 0
+        tot["found_email"] += fe
+        tot["found_phone"] += fp
+        tot["failed"] += failed
+        if final.get("status") == "COMPLETE":
+            # Every child settled (pending is 0).  failed rows are recoverable.
+            msg = f"[green]complete[/green] — found_email={fe} found_phone={fp}"
+            if failed:
+                msg += f" [yellow]failed={failed} (recoverable)[/yellow]"
+            console.print(msg)
+        else:
+            # Poll window elapsed with children still in flight — NOT done.
+            incomplete += 1
+            tot["pending"] += pending
+            console.print(f"[yellow]still running — pending={pending} failed={failed} "
+                          f"found_email={fe} found_phone={fp}; not complete.[/yellow]")
+
+    console.print(f"\nEnrich summary: found_email={tot['found_email']} "
+                  f"found_phone={tot['found_phone']} failed={tot['failed']} "
+                  f"pending={tot['pending']}.")
+    if incomplete or tot["pending"] or tot["failed"]:
+        console.print(
+            "[yellow]Enrichment did NOT fully settle[/yellow] — "
+            f"{tot['pending']} pending, {tot['failed']} failed (both recoverable). "
+            "Re-run the same command later to finish; already-entitled contacts "
+            "are not re-charged. Proceeding to push whatever is entitled so far.")
+
+
 def run_people_sync(crm: str, contacts_path: Path, enrich_email: bool, enrich_phone: bool,
-                    poll_interval: int, poll_timeout: int, dry_run: bool) -> None:
+                    enrich_batch_size: int, poll_interval: int, poll_timeout: int,
+                    dry_run: bool) -> None:
     """Enrich (optional) + push discovered contacts to the CRM via the same
     server-side create-crm endpoint the MCP uses — which matches each contact
     against its parent account's existing CRM contacts and UPDATES in place
@@ -1034,22 +1092,8 @@ def run_people_sync(crm: str, contacts_path: Path, enrich_email: bool, enrich_ph
 
     # ── optional enrichment (spends credits) ─────────────────────────────────
     if enrich_email or enrich_phone:
-        want = ", ".join(f for f, on in (("email", enrich_email), ("phone", enrich_phone)) if on)
-        console.print(f"Enriching [bold]{want}[/bold] for {len(gids)} contact(s) "
-                      f"(spends credits)...", end=" ")
-        sub = grizz_client.enrich_contacts_batch(api_key, gids,
-                                                 include_email=enrich_email,
-                                                 include_phone=enrich_phone)
-        rid = sub.get("request_id")
-        final = _poll_until_terminal(
-            lambda: grizz_client.check_person_enrich_batch(api_key, rid),
-            poll_interval, poll_timeout)
-        if not final or final.get("status") != "COMPLETE":
-            console.print(f"[yellow]{(final or {}).get('status', 'timeout')} — "
-                          f"syncing whatever entitlements exist anyway.[/yellow]")
-        else:
-            console.print(f"[green]done[/green] — found_email={final.get('found_email')} "
-                          f"found_phone={final.get('found_phone')}")
+        _run_enrich(api_key, gids, enrich_email, enrich_phone,
+                    enrich_batch_size, poll_interval, poll_timeout)
 
     records = [{"gid_person": g} for g in gids]
     if dry_run:
@@ -1094,8 +1138,9 @@ def people_sync(
     contacts: Path = typer.Option(..., "--contacts", help="contacts.json from `people discover`, or a CSV/txt of person gids"),
     enrich_email: bool = typer.Option(False, "--enrich-email", help="Enrich work email before sync (spends credits)"),
     enrich_phone: bool = typer.Option(False, "--enrich-phone", help="Enrich phone before sync (spends credits)"),
+    enrich_batch_size: int = typer.Option(50, "--enrich-batch-size", help="Contacts per enrich chunk (<=50 keeps each chunk inside the poll window)."),
     poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
-    poll_timeout: int = typer.Option(600, "--poll-timeout", help="Max seconds to wait per job."),
+    poll_timeout: int = typer.Option(600, "--poll-timeout", help="Max seconds to wait per job/chunk."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),
 ):
     """Push discovered contacts to your CRM — server-side create-OR-update.
@@ -1105,12 +1150,15 @@ def people_sync(
     created otherwise — so a re-sync or an email-less existing contact isn't
     duplicated.  The CRM key rides in the request body as `credentials` (from
     .env); only the Grizz key is a Bearer header.  Discovery is free; email/phone
-    enrichment (--enrich-email/--enrich-phone) is a separate, paid step.
+    enrichment (--enrich-email/--enrich-phone) is a separate, paid step run in
+    chunks — it reports each chunk as complete only once every contact settles,
+    never mid-flight.
     """
     if not contacts.exists():
         console.print(f"[red]Contacts file not found: {contacts}[/red]")
         raise typer.Exit(1)
-    run_people_sync(crm, contacts, enrich_email, enrich_phone,
+    enrich_batch_size = max(1, min(enrich_batch_size, 100))
+    run_people_sync(crm, contacts, enrich_email, enrich_phone, enrich_batch_size,
                     poll_interval, poll_timeout, dry_run)
 
 

@@ -9,6 +9,15 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- `people sync` enrichment now runs in **chunks** (`--enrich-batch-size`, default
+  50) and reports each chunk as complete **only once every contact has settled** —
+  never mid-flight. A chunk that doesn't finish inside the poll window is called
+  out as `pending`/`failed` (both recoverable) with a "re-run later" note, instead
+  of printing "done" and tempting a re-run. (Re-running an already-enriched
+  contact no longer re-charges, per the server-side billing-idempotency fix, but
+  the CLI no longer invites the re-run in the first place.)
+
 ### Added
 - `setup --object contacts` — provision the Grizz Contact fields on HubSpot /
   Salesforce Contact records (the company setup is `--object company`, the
