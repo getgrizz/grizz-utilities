@@ -1060,7 +1060,7 @@ def _run_enrich(api_key: str, gids: list[str], enrich_email: bool, enrich_phone:
         else:
             # Poll window elapsed with children still in flight — NOT done.
             # Do NOT add its partial fe/fp to the totals; the real yield for
-            # this chunk is unknown until it settles on a --resume re-run.
+            # this chunk is unknown until it settles on a re-run of this command.
             incomplete += 1
             tot["pending"] += pending
             console.print(f"[yellow]still running — pending={pending} failed={failed} "
@@ -1151,7 +1151,7 @@ def people_sync(
     enrich_phone: bool = typer.Option(False, "--enrich-phone", help="Enrich phone before sync (spends credits)"),
     enrich_batch_size: int = typer.Option(50, "--enrich-batch-size", help="Contacts per enrich chunk (<=50 keeps each chunk inside the poll window)."),
     poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
-    poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running with --resume (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (the upstream provider retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
+    poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running the same command (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (the upstream provider retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),
 ):
     """Push discovered contacts to your CRM — server-side create-OR-update.
