@@ -35,7 +35,8 @@ _URL_PREFIXES = ("https://", "http://", "www.")
 
 # Attio slugs that need special value shaping on write.
 _DOMAINS_SLUG = "domains"
-_PHONE_SLUGS = frozenset({"grizz_phone", "grizz_contact_hq_phone", "grizz_contact_phone"})
+_PHONE_SLUGS = frozenset({"grizz_phone", "grizz_hq_phone",
+                          "grizz_contact_hq_phone", "grizz_contact_phone"})
 
 
 def _clean_domain(raw: str) -> str | None:
@@ -62,6 +63,69 @@ def _to_e164(raw) -> str | None:
     if len(digits) == 11 and digits.startswith("1"):
         return f"+{digits}"
     return None
+
+
+# ── Object-typed location support ─────────────────────────────────────────────
+# Attio location attributes are object-typed: config maps source fields to
+# sub-fields via dotted slugs (e.g. grizz_location.locality / .region /
+# .country_code), which _shape groups back into one object value.
+_LOCATION_SUBFIELDS = ("line_1", "line_2", "line_3", "line_4",
+                       "locality", "region", "postcode", "country_code")
+
+# Country name → ISO-3166 alpha-2 (Attio requires alpha-2). 2-letter inputs pass
+# through; anything unresolved makes _build_location omit the field.
+_COUNTRY_ISO2 = {
+    "united states": "US", "united states of america": "US", "usa": "US",
+    "u.s.": "US", "u.s.a.": "US", "america": "US",
+    "canada": "CA", "mexico": "MX",
+    "united kingdom": "GB", "uk": "GB", "great britain": "GB", "england": "GB",
+    "scotland": "GB", "wales": "GB", "northern ireland": "GB", "ireland": "IE",
+    "australia": "AU", "new zealand": "NZ",
+    "germany": "DE", "france": "FR", "spain": "ES", "italy": "IT",
+    "portugal": "PT", "netherlands": "NL", "belgium": "BE", "switzerland": "CH",
+    "austria": "AT", "sweden": "SE", "norway": "NO", "denmark": "DK",
+    "finland": "FI", "poland": "PL", "czech republic": "CZ", "czechia": "CZ",
+    "india": "IN", "china": "CN", "japan": "JP", "south korea": "KR",
+    "korea": "KR", "singapore": "SG", "philippines": "PH", "indonesia": "ID",
+    "malaysia": "MY", "thailand": "TH", "vietnam": "VN",
+    "brazil": "BR", "argentina": "AR", "chile": "CL", "colombia": "CO",
+    "peru": "PE", "south africa": "ZA", "israel": "IL",
+    "united arab emirates": "AE", "uae": "AE", "saudi arabia": "SA",
+}
+
+
+def _iso2(country) -> str | None:
+    """Normalize a country name/code to ISO-3166 alpha-2 (Attio requires it).
+    Passes through a 2-letter code; looks a full name up in _COUNTRY_ISO2;
+    returns None when it can't be resolved."""
+    if not country:
+        return None
+    s = str(country).strip()
+    if not s:
+        return None
+    up = s.upper()
+    if len(up) == 2 and up.isalpha():
+        return up
+    return _COUNTRY_ISO2.get(s.lower())
+
+
+def _build_location(parts: dict) -> dict | None:
+    """Assemble an Attio location object from its dotted-slug sub-fields.
+
+    Returns None — so the caller OMITS the attribute rather than 400-ing the
+    whole record — when the country can't be resolved to alpha-2, or there's no
+    locality/region to place. All sub-fields are sent (empty where unknown);
+    latitude/longitude are null."""
+    cc = _iso2(parts.get("country_code") or parts.get("country"))
+    if not cc:
+        return None
+    if not (parts.get("locality") or parts.get("region")):
+        return None
+    loc = {sub: (parts.get(sub) or "") for sub in _LOCATION_SUBFIELDS}
+    loc["country_code"] = cc
+    loc["latitude"] = None
+    loc["longitude"] = None
+    return loc
 
 
 def _first(value):
@@ -248,13 +312,22 @@ class AttioAdapter(CRMAdapter):
 
     @staticmethod
     def _shape(fields: dict) -> dict:
-        """Turn a mapped {slug: value} dict into an Attio `values` payload, and
-        stamp grizz_last_sync = now so freshness/coverage tracks every write."""
+        """Turn a mapped {slug: value} dict into an Attio `values` payload.
+
+        Dotted slugs (e.g. grizz_location.locality) are grouped by their object
+        slug and assembled into one object value via _build_location. The
+        grizz_last_sync stamp is OPT-IN via GRIZZ_STAMP_LAST_SYNC=1: some Attio
+        workspaces have no grizz_last_sync attribute, and stamping an unknown
+        slug 400s the whole record."""
         values: dict = {}
+        obj_parts: dict[str, dict] = {}   # obj_slug -> {sub: value}
         for slug, value in fields.items():
             if slug == "Id":
                 continue
-            if slug == _DOMAINS_SLUG:
+            if "." in slug:
+                obj_slug, sub = slug.split(".", 1)
+                obj_parts.setdefault(obj_slug, {})[sub] = value
+            elif slug == _DOMAINS_SLUG:
                 values[slug] = value if isinstance(value, list) else [value]
             elif slug in _PHONE_SLUGS:
                 e164 = _to_e164(value)
@@ -262,7 +335,12 @@ class AttioAdapter(CRMAdapter):
                     values[slug] = e164
             else:
                 values[slug] = value
-        values[_LAST_SYNC_SLUG] = datetime.now(timezone.utc).isoformat()
+        for obj_slug, parts in obj_parts.items():
+            loc = _build_location(parts)
+            if loc is not None:                # omit rather than 400 on an unresolvable object
+                values[obj_slug] = loc
+        if os.getenv("GRIZZ_STAMP_LAST_SYNC") == "1":
+            values[_LAST_SYNC_SLUG] = datetime.now(timezone.utc).isoformat()
         return values
 
     @staticmethod
@@ -271,16 +349,21 @@ class AttioAdapter(CRMAdapter):
         return resp.text[:200] if resp is not None else f"{type(e).__name__}: {e}"
 
     def _write(self, method: str, url: str, fields: dict) -> requests.Response:
-        """Shape + send a write. If Attio rejects a phone value (400), drop the
-        phone fields and retry once so every OTHER field on the record still
-        lands — a bad phone never costs the whole record."""
+        """Shape + send a write. If Attio rejects a fragile typed value (400) —
+        a phone that isn't E.164, or an object-typed value like a location —
+        drop the offending field(s) named in the error and retry once, so every
+        OTHER field on the record still lands. A bad phone/location never costs
+        the whole record."""
         values = self._shape(fields)
         resp = self._request(method, url, timeout=_WRITE_TIMEOUT, json={"data": {"values": values}})
-        if (resp.status_code == 400 and any(p in values for p in _PHONE_SLUGS)
-                and any(p in resp.text for p in _PHONE_SLUGS)):
-            for p in _PHONE_SLUGS:
-                values.pop(p, None)
-            resp = self._request(method, url, timeout=_WRITE_TIMEOUT, json={"data": {"values": values}})
+        if resp.status_code == 400:
+            fragile = [s for s, v in values.items()
+                       if (s in _PHONE_SLUGS or isinstance(v, dict)) and s in resp.text]
+            if fragile:
+                for s in fragile:
+                    values.pop(s, None)
+                resp = self._request(method, url, timeout=_WRITE_TIMEOUT,
+                                     json={"data": {"values": values}})
         resp.raise_for_status()
         return resp
 

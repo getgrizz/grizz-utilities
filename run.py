@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -92,7 +93,8 @@ def read_account_ids(input_file: Path) -> list[str]:
 
 # ── Core enrichment logic ──────────────────────────────────────────────────────
 
-def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool) -> None:
+def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
+               concurrency: int = 12) -> None:
     """Fetch domains from CRM, enrich via Grizz, write results back."""
 
     # ── Config ──────────────────────────────────────────────────────────────
@@ -140,68 +142,59 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool) -> 
     console.print()
 
     # ── Process ──────────────────────────────────────────────────────────────
-    summary: list[tuple[str, str, str]] = []  # (account_id, outcome, detail)
+    # Attio (and the other CRMs here) have no batch-write API, so throughput
+    # comes from concurrency; the adapters' requests.Session is thread-safe.
+    # Dry-run stays single-threaded for a readable, ordered preview.
+    total = len(account_ids)
 
-    for i, account_id in enumerate(account_ids, 1):
-        prefix = f"[{i}/{len(account_ids)}] {account_id}"
-        console.print(f"{prefix}")
-
-        # 1. Get domain from CRM
+    def _process(account_id: str) -> tuple[str, str, str]:
+        """Enrich one account end-to-end (get domain → Grizz → write).
+        Returns (account_id, outcome, detail); isolates its own errors so a
+        single bad record never aborts the pool."""
         try:
             domain = adapter.get_domain(account_id, domain_field)
         except Exception as e:
-            console.print(f"  [red]Error fetching domain: {e}[/red]")
-            summary.append((account_id, "error", str(e)))
-            continue
-
+            return (account_id, "error", str(e))
         if not domain:
-            console.print(f"  [yellow]No domain on record — skipped.[/yellow]")
-            summary.append((account_id, "skipped", "no domain"))
-            continue
-
-        console.print(f"  Domain: {domain}")
-
-        # 2. Enrich via Grizz
+            return (account_id, "skipped", "no domain")
         try:
-            poll_count = [0]
-
-            def on_status(status: str) -> None:
-                poll_count[0] += 1
-                console.print(f"  Polling ({poll_count[0]})... {status}", end="\r")
-
-            grizz_data = grizz_enrich(grizz_api_key, domain, on_status=on_status)
-            console.print()  # end the polling line
+            # No per-poll on_status spinner — interleaved \r writes are unreadable
+            # across threads.
+            grizz_data = grizz_enrich(grizz_api_key, domain)
         except Exception as e:
-            console.print(f"\n  [red]Grizz error: {e}[/red]")
-            summary.append((account_id, "error", str(e)))
-            continue
-
+            return (account_id, "error", str(e))
         if grizz_data is None:
-            console.print(f"  [yellow]No data available for this domain.[/yellow]")
-            summary.append((account_id, "no_data", domain))
-            continue
-
-        # 3. Map fields
+            return (account_id, "no_data", domain)
         updates = apply_mapping(grizz_data, field_mapping)
         if not updates:
-            console.print(f"  [yellow]No mapped fields returned — nothing to update.[/yellow]")
-            summary.append((account_id, "no_updates", domain))
-            continue
-
-        console.print(f"  Fields: {', '.join(updates.keys())}")
-
-        # 4. Update CRM (or preview)
+            return (account_id, "no_updates", domain)
         if dry_run:
-            console.print(f"  [dim]Would update: {updates}[/dim]")
-            summary.append((account_id, "dry_run", domain))
-        else:
-            try:
-                adapter.update_record(account_id, updates)
-                console.print(f"  [green]Updated.[/green]")
-                summary.append((account_id, "success", domain))
-            except Exception as e:
-                console.print(f"  [red]Update failed: {e}[/red]")
-                summary.append((account_id, "error", str(e)))
+            return (account_id, "dry_run", f"{domain}: {', '.join(updates.keys())}")
+        try:
+            adapter.update_record(account_id, updates)
+            return (account_id, "success", domain)
+        except Exception as e:
+            return (account_id, "error", str(e))
+
+    summary: list[tuple[str, str, str]] = []  # (account_id, outcome, detail)
+
+    if dry_run or concurrency <= 1:
+        for i, account_id in enumerate(account_ids, 1):
+            result = _process(account_id)
+            summary.append(result)
+            _, outcome, detail = result
+            console.print(f"[{i}/{total}] {account_id} — {outcome}"
+                          + (f" ({detail})" if detail else ""))
+    else:
+        console.print(f"Enriching {total} account(s) with concurrency={concurrency}...")
+        done = 0
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(_process, aid) for aid in account_ids]
+            for fut in as_completed(futures):
+                summary.append(fut.result())
+                done += 1
+                if done % 25 == 0 or done == total:
+                    console.print(f"  ...{done}/{total} processed")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     console.print()
@@ -1179,12 +1172,13 @@ def enrich(
     input: Path = typer.Option(..., help="CSV file containing account IDs (requires an 'Id' column)"),
     config: Path = typer.Option(Path("config.yaml"), help="Path to your config.yaml"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without updating the CRM"),
+    concurrency: int = typer.Option(12, "--concurrency", help="Parallel enrich+write workers (these CRMs have no batch-write API, so throughput comes from concurrency). Ignored in --dry-run."),
 ):
     """Enrich CRM accounts from a CSV of account IDs using the Grizz API."""
     if crm not in ADAPTERS:
         console.print(f"[red]Unknown CRM '{crm}'. Available: {', '.join(ADAPTERS)}[/red]")
         raise typer.Exit(1)
-    run_enrich(crm, input, config, dry_run)
+    run_enrich(crm, input, config, dry_run, concurrency)
 
 
 # ── Interactive menu ───────────────────────────────────────────────────────────
