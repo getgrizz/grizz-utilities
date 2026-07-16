@@ -1041,25 +1041,36 @@ def _run_enrich(api_key: str, gids: list[str], enrich_email: bool, enrich_phone:
         fp = final.get("found_phone", 0) or 0
         failed = final.get("failed", 0) or 0
         pending = final.get("pending", 0) or 0
-        tot["found_email"] += fe
-        tot["found_phone"] += fp
+        # `settled` is the server's ground-truth "is this final?" flag; fall
+        # back to status for older servers.  found_email/found_phone are a live
+        # snapshot that undercounts until the chunk settles, so only fold them
+        # into the running totals for SETTLED chunks — otherwise the summary
+        # mixes real yields with partial snapshots (the "reported 40, real 82"
+        # undercount).  failed always counts (it's terminal per-row).
+        settled = bool(final.get("settled")) or final.get("status") == "COMPLETE"
         tot["failed"] += failed
-        if final.get("status") == "COMPLETE":
+        if settled:
             # Every child settled (pending is 0).  failed rows are recoverable.
+            tot["found_email"] += fe
+            tot["found_phone"] += fp
             msg = f"[green]complete[/green] — found_email={fe} found_phone={fp}"
             if failed:
                 msg += f" [yellow]failed={failed} (recoverable)[/yellow]"
             console.print(msg)
         else:
             # Poll window elapsed with children still in flight — NOT done.
+            # Do NOT add its partial fe/fp to the totals; the real yield for
+            # this chunk is unknown until it settles on a --resume re-run.
             incomplete += 1
             tot["pending"] += pending
             console.print(f"[yellow]still running — pending={pending} failed={failed} "
-                          f"found_email={fe} found_phone={fp}; not complete.[/yellow]")
+                          f"found so far (partial, not counted)={fe}e/{fp}p; "
+                          f"not complete, re-run to settle.[/yellow]")
 
+    settled_note = "" if not incomplete else f" (from {n_batches - incomplete}/{n_batches} settled chunks)"
     console.print(f"\nEnrich summary: found_email={tot['found_email']} "
-                  f"found_phone={tot['found_phone']} failed={tot['failed']} "
-                  f"pending={tot['pending']}.")
+                  f"found_phone={tot['found_phone']}{settled_note} "
+                  f"failed={tot['failed']} pending={tot['pending']}.")
     if incomplete or tot["pending"] or tot["failed"]:
         console.print(
             "[yellow]Enrichment did NOT fully settle[/yellow] — "
@@ -1140,7 +1151,7 @@ def people_sync(
     enrich_phone: bool = typer.Option(False, "--enrich-phone", help="Enrich phone before sync (spends credits)"),
     enrich_batch_size: int = typer.Option(50, "--enrich-batch-size", help="Contacts per enrich chunk (<=50 keeps each chunk inside the poll window)."),
     poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
-    poll_timeout: int = typer.Option(600, "--poll-timeout", help="Max seconds to wait per job/chunk."),
+    poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running with --resume (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (the upstream provider retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),
 ):
     """Push discovered contacts to your CRM — server-side create-OR-update.
