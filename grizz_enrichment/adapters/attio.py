@@ -178,6 +178,16 @@ class _AttioBase:
 
     def __init__(self):
         self._session: requests.Session | None = None
+        # Slugs to E.164-normalize on write. Seeded from the canonical defaults but
+        # EXTENDED from config (field_types: <slug>: phone-number) via
+        # set_phone_slugs — so a customer can make ANY slug a phone field without
+        # editing the package. Config drives the type; this is just the fallback.
+        self._phone_slugs: frozenset = _PHONE_SLUGS
+
+    def set_phone_slugs(self, extra) -> None:
+        """Add config-declared phone-number slugs to the set the writer
+        E.164-normalizes (union with the built-in defaults)."""
+        self._phone_slugs = _PHONE_SLUGS | frozenset(extra or ())
 
     def connect(self) -> None:
         """Connect using ATTIO_API_KEY."""
@@ -265,7 +275,7 @@ class _AttioBase:
                 obj_parts.setdefault(obj_slug, {})[sub] = value
             elif slug == _DOMAINS_SLUG:
                 values[slug] = value if isinstance(value, list) else [value]
-            elif slug in _PHONE_SLUGS:
+            elif slug in self._phone_slugs:
                 e164 = _to_e164(value)
                 if e164:                       # drop if not normalizable (Attio rejects malformed)
                     values[slug] = e164
@@ -295,7 +305,7 @@ class _AttioBase:
         resp = self._request(method, url, timeout=_WRITE_TIMEOUT, json={"data": {"values": values}})
         if resp.status_code == 400:
             fragile = [s for s, v in values.items()
-                       if (s in _PHONE_SLUGS or isinstance(v, dict)
+                       if (s in self._phone_slugs or isinstance(v, dict)
                            or s in self._FRAGILE_LIST_SLUGS) and s in resp.text]
             if fragile:
                 for s in fragile:
@@ -483,9 +493,11 @@ class AttioContactAdapter(_AttioBase):
 
     def use_native_slugs(self, *, name: str, email: str, phone: str,
                          company_ref: str, person_id: str | None,
-                         last_sync: str | None = None) -> None:
+                         last_sync: str | None = None, phone_slugs=None) -> None:
         """Point the adapter at this workspace's native People attribute slugs
-        (from config.yaml) and the grizz person-id attribute used for dedup."""
+        (from config.yaml) and the grizz person-id attribute used for dedup.
+        `phone_slugs` are the config-declared phone-number attributes to
+        E.164-normalize on write (in addition to the built-in defaults)."""
         self._name_slug = name
         self._email_slug = email
         self._phone_slug = phone
@@ -493,6 +505,8 @@ class AttioContactAdapter(_AttioBase):
         self._person_id_slug = person_id
         if last_sync:
             self._LAST_SYNC = last_sync
+        if phone_slugs:
+            self.set_phone_slugs(phone_slugs)
         # phone + company-ref are non-essential typed lists — safe to drop on a
         # 400 so the rest of the record still lands. email is the dedup key and
         # name is a dict (already covered by _write), so neither is auto-dropped.

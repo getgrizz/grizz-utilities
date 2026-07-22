@@ -96,16 +96,22 @@ hubspot:
 
 
 # ── Attio ────────────────────────────────────────────────────────────────────
-# Run `python run.py setup --crm attio` to create these attributes first
-# (needs GRIZZ_API_KEY + ATTIO_API_KEY).  The slugs below are the fixed grizz_*
-# attributes Grizz provisions — leave them as-is unless you renamed them.
+# Run `python run.py setup --crm attio` to create these attributes.  The slugs
+# below are the grizz_* attributes Grizz uses — rename any to match what you
+# already built and setup will see it exists.
 # Notes on Attio's design (handled for you):
 #   * `domain_field` is the native `domains` attribute (the unique dedup key);
 #     it is written only when creating a new record, not on update.
 #   * there is no Grizz domain or company-description attribute on Attio.
+#   * Attribute TYPES are config-driven via an optional `field_types:` block
+#     (e.g. `field_types: { grizz_phone: phone-number }`) — nothing is hardcoded;
+#     phone-number slugs get built-in cleansing and are E.164-normalized on write.
 
 attio:
   domain_field: domains
+
+  # field_types:                 # optional — declare non-text Attio types here
+  #   grizz_phone: phone-number
 
   field_mapping:
 
@@ -170,6 +176,17 @@ attio_contacts:
   company_ref:   company           # native Companies reference — parent link, set on create only
   # last_sync_field: grizz_contact_last_sync   # optional; stamped only with GRIZZ_STAMP_LAST_SYNC=1
 
+  # Attio attribute TYPES are config-driven — declare any slug's type here and
+  # setup creates it that way (nothing is hardcoded in the package). Phone-number
+  # slugs get Attio's built-in cleansing and are E.164-normalized on write.
+  # Location is typed automatically by the dotted-slug syntax below; plain slugs
+  # default to text; the standard grizz phone slugs are phone-number by default.
+  # Only declare field_types for a RENAMED/custom slug — e.g. if you archived a
+  # field and must recreate it under a new name (Attio keeps archived slugs
+  # reserved, so the old name can't be reused with a different type):
+  # field_types:
+  #   grizz_contact_direct_phone: phone-number
+
   field_mapping:
     gid:          grizz_person_id            # dedup id — stamped on write, matched before email
     company_gid:  grizz_contact_company_gid  # parent company's gid_company
@@ -178,7 +195,7 @@ attio_contacts:
     department:   grizz_contact_job_function
     persona:      grizz_contact_persona
     email:        grizz_contact_email        # Grizz's email for the contact (always written)
-    phone:        grizz_contact_phone        # phone-number type (created with cleansing) — same as company grizz_phone
+    phone:        grizz_contact_phone        # phone-number by default (rename + field_types if archived)
     linkedin_url: grizz_contact_linkedin_url
     # location → ONE object-typed attribute (city/state/country collapse)
     city:         grizz_contact_location.locality

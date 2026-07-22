@@ -56,35 +56,34 @@ def _title(slug: str) -> str:
     return " ".join(w.capitalize() for w in slug.split("_")) or slug
 
 
-def _plan_from_mapping(field_mapping: dict, skip: set[str]) -> list[dict]:
+def _plan_from_mapping(field_mapping: dict, skip: set[str],
+                       field_types: dict | None = None) -> list[dict]:
     """Turn a config field_mapping into the attribute specs to ensure exist.
 
-    Dotted slugs (grizz_location.locality) collapse to ONE `location`-typed
-    attribute per prefix; phone slugs (the shared `_PHONE_SLUGS` set, e.g.
-    grizz_phone / grizz_contact_phone) get Attio's `phone-number` type so the
-    field carries built-in cleansing; every other mapped slug is a `text`
-    attribute; native slugs in `skip` (and the domain/`*_field` natives) are
-    dropped."""
-    location_attrs: list[str] = []       # object-typed, order-preserving, deduped
-    phone_attrs: list[str] = []
-    text_attrs: list[str] = []
-    seen: set[str] = set()
+    The Attio TYPE of each attribute is CONFIG-DRIVEN — nothing is hardcoded:
+      * dotted slugs (grizz_location.locality) collapse to ONE `location`-typed
+        attribute per prefix (the dotted syntax *is* the type declaration);
+      * any slug listed in the config's `field_types` map uses that type verbatim
+        (e.g. `grizz_contact_direct_phone: phone-number` → built-in cleansing);
+      * a slug in the built-in `_PHONE_SLUGS` defaults falls back to
+        `phone-number` (so existing configs keep working without declaring types);
+      * everything else is `text`.
+    Native slugs in `skip` (the domain/`*_field` references) are dropped."""
+    field_types = field_types or {}
+    resolved: dict[str, str] = {}        # slug -> type, order-preserving, deduped
     for target in field_mapping.values():
         if not target or not isinstance(target, str):
             continue
         if "." in target:                # dotted sub-field → object-typed attribute
-            attr, bucket = target.split(".", 1)[0], location_attrs
-        elif target in _PHONE_SLUGS:     # phone number → phone-number type (cleansing)
-            attr, bucket = target, phone_attrs
+            slug, typ = target.split(".", 1)[0], "location"
         else:
-            attr, bucket = target, text_attrs
-        if attr in skip or attr in seen:
+            slug = target
+            typ = (field_types.get(target)
+                   or ("phone-number" if target in _PHONE_SLUGS else "text"))
+        if slug in skip or slug in resolved:
             continue
-        seen.add(attr)
-        bucket.append(attr)
-    return ([{"api_slug": a, "title": _title(a), "type": "location"} for a in location_attrs]
-            + [{"api_slug": a, "title": _title(a), "type": "phone-number"} for a in phone_attrs]
-            + [{"api_slug": a, "title": _title(a), "type": "text"} for a in text_attrs])
+        resolved[slug] = typ
+    return [{"api_slug": s, "title": _title(s), "type": t} for s, t in resolved.items()]
 
 
 def _existing_slugs(session: requests.Session, object_slug: str) -> set[str]:
@@ -145,6 +144,7 @@ def run_setup(dry_run: bool = False, object_: str = "company",
     config = yaml.safe_load(config_path.read_text()) or {}
     sec = config.get(section) or {}
     field_mapping = sec.get("field_mapping") or {}
+    field_types = sec.get("field_types") or {}   # config-driven Attio types
     if not field_mapping:
         raise RuntimeError(f"No '{section}: field_mapping' in {config_path} — nothing to set up. "
                            f"Copy the [{section}] section from config.example.yaml.")
@@ -156,7 +156,7 @@ def run_setup(dry_run: bool = False, object_: str = "company",
         if sec.get(k):
             skip.add(sec[k])
 
-    specs = _plan_from_mapping(field_mapping, skip)
+    specs = _plan_from_mapping(field_mapping, skip, field_types)
 
     session = _session(attio_key)
     me = session.get(f"{_BASE_URL}/v2/self", timeout=_TIMEOUT)

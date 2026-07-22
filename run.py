@@ -132,6 +132,8 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         console.print(f"\n[red]Connection failed: {e}[/red]")
         raise typer.Exit(1)
     console.print("[green]connected.[/green]")
+    if crm == "attio":
+        adapter.set_phone_slugs(_attio_phone_slugs(crm_config))
 
     # ── Input ────────────────────────────────────────────────────────────────
     account_ids = read_account_ids(input_file)
@@ -485,6 +487,8 @@ def run_audience(
         console.print(f"\n[red]Connection failed: {e}[/red]")
         raise typer.Exit(1)
     console.print("[green]connected.[/green]")
+    if crm == "attio":
+        adapter.set_phone_slugs(_attio_phone_slugs(crm_config))
 
     if dry_run:
         console.print("[yellow]Dry run mode — CRM will not be updated.[/yellow]")
@@ -1139,6 +1143,15 @@ def run_people_sync(crm: str, contacts_path: Path, enrich_email: bool, enrich_ph
 
 # ── Attio contact sync (client-side, mirrors the company audience path) ─────────
 
+def _attio_phone_slugs(crm_config: dict) -> set[str]:
+    """Config-declared phone-number slugs (`field_types: <slug>: phone-number`),
+    so the Attio adapter E.164-normalizes ANY slug the config types as a phone —
+    no slug list is hardcoded in the package."""
+    field_types = (crm_config or {}).get("field_types") or {}
+    return {slug for slug, typ in field_types.items()
+            if str(typ).strip().lower() == "phone-number"}
+
+
 def _read_person_records(path: Path) -> list[dict]:
     """Read FULL person records (not just gids) from a `people discover`
     contacts.json.  The client-side Attio contact write puts name / title /
@@ -1333,7 +1346,8 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
         raise typer.Exit(1)
     adapter.use_native_slugs(name=native["name"], email=native["email"],
                              phone=native["phone"], company_ref=native["company_ref"],
-                             person_id=person_id_slug, last_sync=cc.get("last_sync_field"))
+                             person_id=person_id_slug, last_sync=cc.get("last_sync_field"),
+                             phone_slugs=_attio_phone_slugs(cc))
     console.print("[green]connected.[/green]")
 
     # ── resolve parent-company record ids for the native company reference ───

@@ -31,6 +31,16 @@ This project uses [Semantic Versioning](https://semver.org/).
   resolves + counts without writing.
 
 ### Changed
+- **Attio attribute types are config-driven — nothing is hardcoded.** A new
+  optional `field_types:` block in the `attio:` / `attio_contacts:` config sections
+  declares any slug's Attio type (e.g. `grizz_contact_direct_phone: phone-number`),
+  and both `setup` (attribute creation) and the write adapter (E.164 normalization)
+  read it. Previously phone fields were gated by a hardcoded slug set, so a renamed
+  or custom phone slug landed as plain text and wasn't cleansed — now the config
+  controls it, no package edit needed. The built-in phone slugs remain as a
+  backward-compatible default, and location stays typed by the dotted-slug syntax.
+  (Useful when Attio blocks recreating an archived slug and you must map to a fresh
+  name.)
 - **`setup --crm attio` is now config-driven.** It reads the slugs you actually map
   in `config.yaml` (`attio:` for Companies, `attio_contacts:` for People) and
   creates exactly those — so it can't duplicate or clobber attributes you already
