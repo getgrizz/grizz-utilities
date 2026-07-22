@@ -9,6 +9,34 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`people sync --crm attio`** — client-side contact sync for Attio, mirroring the
+  company `audience` flow instead of the server `/people/create-crm/` endpoint
+  (which is HubSpot/Salesforce-only). Reads a `people discover` `contacts.json`,
+  maps person fields via the new **`attio_contacts:`** section of `config.yaml`,
+  and writes People through the local Attio REST adapter. Because it's the same
+  client-side mapping the company path uses, it **collapses city/state/country
+  into one object-typed location attribute** (e.g. `grizz_contact_location`) — the
+  Attio-native shape — rather than three separate text fields. Matches each
+  contact to an existing person by the Grizz person gid then native email
+  (updates in place, never duplicates), links it to its parent Company record,
+  and writes the native name/email/phone alongside the mapped `grizz_contact_*`
+  attributes. `--enrich-email`/`--enrich-phone` fetch fresh contact info first;
+  `--dry-run` resolves + counts without writing.
+
+### Changed
+- **`setup --crm attio` is now config-driven.** It reads the slugs you actually map
+  in `config.yaml` (`attio:` for Companies, `attio_contacts:` for People) and
+  creates exactly those — so it can't duplicate or clobber attributes you already
+  built or renamed, and it only ever writes to the ONE object you ask for
+  (`--object company` **or** `--object contacts`, never both). Dotted location
+  sub-fields provision a single `location`-typed attribute; native attributes
+  (`domains`, `name`, `email_addresses`, `phone_numbers`, `company`) are never
+  (re)created. No longer needs `GRIZZ_API_KEY` — it no longer fetches the server
+  catalog. (Previously it pulled the canonical catalog and provisioned both
+  objects together, which created duplicate `grizz_*` fields next to any you'd
+  renamed.)
+
 ### Changed
 - `people sync` enrichment now runs in **chunks** (`--enrich-batch-size`, default
   50) and reports each chunk as complete **only once every contact has settled** —

@@ -298,11 +298,17 @@ HubSpot — same `config.yaml` mapping, same matching (by Grizz company ID, then
 domain), same create/update behavior. There are only two design-forced
 differences, and the tool handles both for you:
 
-- **`setup --crm attio` needs your Grizz key too.** Attio's attribute list is
-  pulled from Grizz at runtime (so it always matches the current Grizz schema)
-  rather than hardcoded, so set `GRIZZ_API_KEY` alongside `ATTIO_API_KEY`.
+- **`setup --crm attio` is config-driven.** It reads the slugs you map in
+  `config.yaml` and creates only those, so it never duplicates or clobbers
+  attributes you already built or renamed — and `--object company` / `--object
+  contacts` each provision just that one object. (No `GRIZZ_API_KEY` needed for
+  setup.)
 - **Dedup is on the native `domains` attribute.** Attio has no Grizz domain field;
   the company's domain is written to native `domains` only when creating a record.
+- **Location is one object-typed attribute.** Attio holds city + region + country
+  in a single location attribute, so `config.yaml` maps them as dotted sub-fields
+  (`grizz_location.locality` / `.region` / `.country_code`) that the tool
+  collapses into one value on write (country normalized to ISO alpha-2).
 
 **Credentials** — add both to your `.env`:
 
@@ -334,7 +340,28 @@ python run.py audience --crm attio --prompt "Mid-market US roofing contractors"
 The `audience` flow matches each company to an existing Attio record (by
 `grizz_company_id`, then `domains`), updates the matches, and offers to create the
 rest as new companies. The `attio:` section of `config.yaml` is pre-filled with the
-canonical `grizz_*` slugs — leave it as-is unless you renamed an attribute.
+canonical `grizz_*` slugs — **edit it to match whatever you named your attributes**
+(setup and sync both read these slugs, so if you built `grizz_hq_phone` rather than
+`grizz_phone`, point the mapping there and setup will see it already exists).
+
+**3. Sync contacts (People)** — Attio is headless, so contacts sync **client-side**,
+the same model as companies (there is no server-side Attio contact endpoint):
+
+```bash
+python run.py setup   --crm attio --object contacts     # create the People grizz_contact_* attributes
+python run.py people discover --input companies.csv --out-dir people_out
+python run.py people sync --crm attio --contacts people_out/contacts.json --enrich-email
+```
+
+The `attio_contacts:` section of `config.yaml` maps person fields to your Attio
+People attributes. `people sync --crm attio` matches each contact to an existing
+person (by the Grizz person gid, then native email — updating in place, never
+duplicating), links it to its parent Company record, and writes the native
+name/email/phone plus the mapped `grizz_contact_*` attributes — with
+city/state/country collapsed into one location attribute, just like companies.
+
+> **Attio People scope.** For contacts, grant the `ATTIO_API_KEY` read/write on
+> **Objects → People** (records + attributes) in addition to Companies.
 
 > **Bulk loads are for domain admins.** A full-tier sync reads and writes many CRM
 > records; treat this script as an operator/admin tool, not something every AE or

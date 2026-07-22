@@ -10,6 +10,12 @@ records in {"properties": ...}:
   * the native `domains` attribute is multi-value, so it is sent as a list;
   * phone-number attributes must be E.164 or Attio rejects the whole record,
     so phones are normalized (and dropped if they can't be).
+
+Two objects share this file: `AttioAdapter` (Companies — the setup/enrich/audience
+flow) and `AttioContactAdapter` (People — the `people sync --crm attio` flow).
+Everything object-agnostic (connect, retrying HTTP, the {slug: value} → Attio
+`values` shaping, the concurrent write pool) lives on `_AttioBase`; each subclass
+adds only its object's find / create / update semantics.
 """
 
 import os
@@ -22,7 +28,6 @@ import requests
 from .base import CRMAdapter
 
 _BASE_URL = "https://api.attio.com"
-_OBJECT = "companies"
 _GID_SLUG = "grizz_gid"              # gid_company — the canonical driving id (api.md §10)
 _LAST_SYNC_SLUG = "grizz_last_sync"  # stamped (now) on every write so freshness tracks
 _QUERY_BATCH = 100   # values per $in query
@@ -160,7 +165,16 @@ def _chunks(seq, n):
         yield seq[i:i + n]
 
 
-class AttioAdapter(CRMAdapter):
+class _AttioBase:
+    """Object-agnostic Attio plumbing shared by the Companies and People adapters:
+    connection + pooling, retrying HTTP, records query, {slug: value} → Attio
+    `values` shaping (incl. object-typed location assembly), the fragile-field
+    400-retry, and the concurrent per-record write pool.  Subclasses set
+    ``_OBJECT`` and add their object's find / create / update methods."""
+
+    _OBJECT = ""                       # attio object slug, set by subclass
+    _LAST_SYNC = _LAST_SYNC_SLUG       # slug stamped on every write (opt-in via env)
+    _FRAGILE_LIST_SLUGS: frozenset = frozenset()  # list-typed slugs safe to drop on 400
 
     def __init__(self):
         self._session: requests.Session | None = None
@@ -215,12 +229,12 @@ class AttioAdapter(CRMAdapter):
     # ── reads ────────────────────────────────────────────────────────────────
 
     def _query(self, filter_: dict) -> list[dict]:
-        """Run a records query, paging through all results."""
+        """Run a records query on this adapter's object, paging through all results."""
         out: list[dict] = []
         offset = 0
         while True:
             resp = self._request(
-                "POST", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/query",
+                "POST", f"{_BASE_URL}/v2/objects/{self._OBJECT}/records/query",
                 timeout=_READ_TIMEOUT,
                 json={"filter": filter_, "limit": _QUERY_PAGE, "offset": offset},
             )
@@ -231,10 +245,88 @@ class AttioAdapter(CRMAdapter):
                 return out
             offset += _QUERY_PAGE
 
+    # ── writes ────────────────────────────────────────────────────────────────
+
+    def _shape(self, fields: dict) -> dict:
+        """Turn a mapped {slug: value} dict into an Attio `values` payload.
+
+        Dotted slugs (e.g. grizz_location.locality) are grouped by their object
+        slug and assembled into one object value via _build_location. The
+        last-sync stamp is OPT-IN via GRIZZ_STAMP_LAST_SYNC=1: some Attio
+        workspaces have no last-sync attribute, and stamping an unknown slug 400s
+        the whole record."""
+        values: dict = {}
+        obj_parts: dict[str, dict] = {}   # obj_slug -> {sub: value}
+        for slug, value in fields.items():
+            if slug == "Id":
+                continue
+            if "." in slug:
+                obj_slug, sub = slug.split(".", 1)
+                obj_parts.setdefault(obj_slug, {})[sub] = value
+            elif slug == _DOMAINS_SLUG:
+                values[slug] = value if isinstance(value, list) else [value]
+            elif slug in _PHONE_SLUGS:
+                e164 = _to_e164(value)
+                if e164:                       # drop if not normalizable (Attio rejects malformed)
+                    values[slug] = e164
+            else:
+                values[slug] = value
+        for obj_slug, parts in obj_parts.items():
+            loc = _build_location(parts)
+            if loc is not None:                # omit rather than 400 on an unresolvable object
+                values[obj_slug] = loc
+        if os.getenv("GRIZZ_STAMP_LAST_SYNC") == "1" and self._LAST_SYNC:
+            values[self._LAST_SYNC] = datetime.now(timezone.utc).isoformat()
+        return values
+
+    @staticmethod
+    def _err(e: Exception) -> str:
+        resp = getattr(e, "response", None)
+        return resp.text[:200] if resp is not None else f"{type(e).__name__}: {e}"
+
+    def _write(self, method: str, url: str, fields: dict) -> requests.Response:
+        """Shape + send a write. If Attio rejects a fragile typed value (400) —
+        a phone that isn't E.164, an object-typed value like a location, or a
+        list-typed native attribute named in _FRAGILE_LIST_SLUGS — drop the
+        offending field(s) named in the error and retry once, so every OTHER
+        field on the record still lands. A bad phone/location never costs the
+        whole record."""
+        values = self._shape(fields)
+        resp = self._request(method, url, timeout=_WRITE_TIMEOUT, json={"data": {"values": values}})
+        if resp.status_code == 400:
+            fragile = [s for s, v in values.items()
+                       if (s in _PHONE_SLUGS or isinstance(v, dict)
+                           or s in self._FRAGILE_LIST_SLUGS) and s in resp.text]
+            if fragile:
+                for s in fragile:
+                    values.pop(s, None)
+                resp = self._request(method, url, timeout=_WRITE_TIMEOUT,
+                                     json={"data": {"values": values}})
+        resp.raise_for_status()
+        return resp
+
+    def _parallel(self, records: list[dict], fn) -> list[dict]:
+        """Run a per-record write fn concurrently (Attio has no batch-write API),
+        preserving input order.  Each fn isolates its own errors, so the pool
+        never aborts on one bad record; transient 429/timeout backoff (in
+        _request) keeps the pool busy rather than failing fast."""
+        if not records:
+            return []
+        workers = min(_WRITE_CONCURRENCY, len(records))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(fn, records))
+
+
+class AttioAdapter(_AttioBase, CRMAdapter):
+
+    _OBJECT = "companies"
+
+    # ── reads ────────────────────────────────────────────────────────────────
+
     def get_domain(self, record_id: str, domain_field: str) -> str | None:
         """Return the company's primary domain (domain_field is 'domains')."""
         resp = self._request(
-            "GET", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}",
+            "GET", f"{_BASE_URL}/v2/objects/{self._OBJECT}/records/{record_id}",
             timeout=_READ_TIMEOUT,
         )
         resp.raise_for_status()
@@ -308,82 +400,26 @@ class AttioAdapter(CRMAdapter):
                             matched[k] = rec["id"]["record_id"]
         return matched
 
+    def gid_to_record_ids(self, gids: list[str]) -> dict[str, str]:
+        """Map gid_company → Attio company record_id, for linking people to their
+        parent company (the People adapter's native company reference)."""
+        out: dict[str, str] = {}
+        uniq = list(dict.fromkeys(str(g) for g in gids if g))
+        for batch in _chunks(uniq, _QUERY_BATCH):
+            for rec in self._query({_GID_SLUG: {"$in": batch}}):
+                g = _first(rec.get("values", {}).get(_GID_SLUG))
+                if g:
+                    out[str(g)] = rec["id"]["record_id"]
+        return out
+
     # ── writes ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _shape(fields: dict) -> dict:
-        """Turn a mapped {slug: value} dict into an Attio `values` payload.
-
-        Dotted slugs (e.g. grizz_location.locality) are grouped by their object
-        slug and assembled into one object value via _build_location. The
-        grizz_last_sync stamp is OPT-IN via GRIZZ_STAMP_LAST_SYNC=1: some Attio
-        workspaces have no grizz_last_sync attribute, and stamping an unknown
-        slug 400s the whole record."""
-        values: dict = {}
-        obj_parts: dict[str, dict] = {}   # obj_slug -> {sub: value}
-        for slug, value in fields.items():
-            if slug == "Id":
-                continue
-            if "." in slug:
-                obj_slug, sub = slug.split(".", 1)
-                obj_parts.setdefault(obj_slug, {})[sub] = value
-            elif slug == _DOMAINS_SLUG:
-                values[slug] = value if isinstance(value, list) else [value]
-            elif slug in _PHONE_SLUGS:
-                e164 = _to_e164(value)
-                if e164:                       # drop if not normalizable (Attio rejects malformed)
-                    values[slug] = e164
-            else:
-                values[slug] = value
-        for obj_slug, parts in obj_parts.items():
-            loc = _build_location(parts)
-            if loc is not None:                # omit rather than 400 on an unresolvable object
-                values[obj_slug] = loc
-        if os.getenv("GRIZZ_STAMP_LAST_SYNC") == "1":
-            values[_LAST_SYNC_SLUG] = datetime.now(timezone.utc).isoformat()
-        return values
-
-    @staticmethod
-    def _err(e: Exception) -> str:
-        resp = getattr(e, "response", None)
-        return resp.text[:200] if resp is not None else f"{type(e).__name__}: {e}"
-
-    def _write(self, method: str, url: str, fields: dict) -> requests.Response:
-        """Shape + send a write. If Attio rejects a fragile typed value (400) —
-        a phone that isn't E.164, or an object-typed value like a location —
-        drop the offending field(s) named in the error and retry once, so every
-        OTHER field on the record still lands. A bad phone/location never costs
-        the whole record."""
-        values = self._shape(fields)
-        resp = self._request(method, url, timeout=_WRITE_TIMEOUT, json={"data": {"values": values}})
-        if resp.status_code == 400:
-            fragile = [s for s, v in values.items()
-                       if (s in _PHONE_SLUGS or isinstance(v, dict)) and s in resp.text]
-            if fragile:
-                for s in fragile:
-                    values.pop(s, None)
-                resp = self._request(method, url, timeout=_WRITE_TIMEOUT,
-                                     json={"data": {"values": values}})
-        resp.raise_for_status()
-        return resp
 
     def update_record(self, record_id: str, fields: dict) -> None:
         """Patch a single company record."""
         resp = self._write(
-            "PATCH", f"{_BASE_URL}/v2/objects/{_OBJECT}/records/{record_id}", fields,
+            "PATCH", f"{_BASE_URL}/v2/objects/{self._OBJECT}/records/{record_id}", fields,
         )
         resp.raise_for_status()
-
-    def _parallel(self, records: list[dict], fn) -> list[dict]:
-        """Run a per-record write fn concurrently (Attio has no batch-write API),
-        preserving input order.  Each fn isolates its own errors, so the pool
-        never aborts on one bad record; transient 429/timeout backoff (in
-        _request) keeps the pool busy rather than failing fast."""
-        if not records:
-            return []
-        workers = min(_WRITE_CONCURRENCY, len(records))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            return list(ex.map(fn, records))
 
     def _update_one(self, r: dict) -> dict:
         record_id = r["Id"]
@@ -395,7 +431,7 @@ class AttioAdapter(CRMAdapter):
 
     def _create_one(self, r: dict) -> dict:
         try:
-            resp = self._write("POST", f"{_BASE_URL}/v2/objects/{_OBJECT}/records", r)
+            resp = self._write("POST", f"{_BASE_URL}/v2/objects/{self._OBJECT}/records", r)
             new_id = resp.json().get("data", {}).get("id", {}).get("record_id", "")
             return {"id": new_id, "success": True, "errors": []}
         except Exception as e:  # isolate ANY per-record failure, never abort the batch
@@ -412,4 +448,145 @@ class AttioAdapter(CRMAdapter):
 
     def create_accounts(self, records: list[dict]) -> list[dict]:
         """Create companies concurrently.  Per-record failures are isolated."""
+        return self._parallel(records, self._create_one)
+
+
+class AttioContactAdapter(_AttioBase):
+    """People-object twin of AttioAdapter for `people sync --crm attio`.
+
+    Same client-side model as the company path — config.yaml maps Grizz person
+    fields to Attio People attributes, and the shared _shape collapses
+    city/state/country into ONE object-typed location attribute (e.g.
+    grizz_contact_location) exactly like companies collapse into grizz_location.
+
+    Beyond the mapped grizz_* attributes, People carry a handful of NATIVE typed
+    attributes that need their own shaping (personal-name, email/phone lists, the
+    Companies record-reference).  Their slugs are workspace-configurable, so they
+    come from config.yaml via use_native_slugs() rather than being hardcoded.
+    Dedup is on the person's Grizz gid (a configured id attribute) first, then the
+    native unique email attribute — mirroring the company gid → domains cascade.
+    """
+
+    _OBJECT = "people"
+    _LAST_SYNC = "grizz_contact_last_sync"
+
+    # config-driven slugs, populated by use_native_slugs()
+    _name_slug = "name"
+    _email_slug = "email_addresses"
+    _phone_slug = "phone_numbers"
+    _company_ref_slug = "company"
+    _person_id_slug: str | None = None   # the grizz person-gid attribute, if mapped
+
+    def use_native_slugs(self, *, name: str, email: str, phone: str,
+                         company_ref: str, person_id: str | None,
+                         last_sync: str | None = None) -> None:
+        """Point the adapter at this workspace's native People attribute slugs
+        (from config.yaml) and the grizz person-id attribute used for dedup."""
+        self._name_slug = name
+        self._email_slug = email
+        self._phone_slug = phone
+        self._company_ref_slug = company_ref
+        self._person_id_slug = person_id
+        if last_sync:
+            self._LAST_SYNC = last_sync
+        # phone + company-ref are non-essential typed lists — safe to drop on a
+        # 400 so the rest of the record still lands. email is the dedup key and
+        # name is a dict (already covered by _write), so neither is auto-dropped.
+        self._FRAGILE_LIST_SLUGS = frozenset({self._phone_slug, self._company_ref_slug})
+
+    # ── reads ────────────────────────────────────────────────────────────────
+
+    def find_people_bulk(self, people: list[dict]) -> dict[str, str]:
+        """Match discovered people to existing Attio person records — by the
+        Grizz person gid (the configured id attribute) first, then falling back to
+        the native unique email attribute.  Returns a map keyed by BOTH the gid
+        and the lowercased email, so run.py can look a record up by either."""
+        matched: dict[str, str] = {}
+
+        by_gid = {str(p["gid"]): p for p in people if p.get("gid")} if self._person_id_slug else {}
+        gids_hit: set[str] = set()
+
+        # 1) primary: gid_person -> the configured grizz person-id attribute
+        if self._person_id_slug and by_gid:
+            for batch in _chunks(list(by_gid), _QUERY_BATCH):
+                for rec in self._query({self._person_id_slug: {"$in": batch}}):
+                    recgid = _first(rec.get("values", {}).get(self._person_id_slug))
+                    p = by_gid.get(str(recgid))
+                    if p:
+                        gids_hit.add(str(recgid))
+                        rid = rec["id"]["record_id"]
+                        matched[str(p["gid"])] = rid
+                        if p.get("email"):
+                            matched[p["email"].lower()] = rid
+
+        # 2) fallback: native email for people not matched by gid
+        rem = [p for g, p in by_gid.items() if g not in gids_hit]
+        rem += [p for p in people if not p.get("gid")]
+        email_to_p = {e: p for p in rem if (e := (p.get("email") or "").strip().lower())}
+        for batch in _chunks(list(email_to_p), _QUERY_BATCH):
+            ors = [{self._email_slug: {"email_address": e}} for e in batch]
+            for rec in self._query({"$or": ors}):
+                rid = rec["id"]["record_id"]
+                for ev in rec.get("values", {}).get(self._email_slug, []):
+                    ea = (ev.get("email_address") or "").strip().lower()
+                    p = email_to_p.get(ea)
+                    if p:
+                        matched[ea] = rid
+                        if p.get("gid"):
+                            matched[str(p["gid"])] = rid
+        return matched
+
+    # ── writes ────────────────────────────────────────────────────────────────
+
+    def _shape(self, fields: dict) -> dict:
+        """Shape a person record: the mapped grizz_* attributes go through the
+        shared shaper (collapsing the object-typed location), then the NATIVE
+        People attributes carried under the '_native' key are added in their
+        Attio-specific shapes (personal-name object, email/phone lists, the
+        Companies record-reference)."""
+        native = fields.get("_native") or {}
+        grizz = {k: v for k, v in fields.items() if k not in ("Id", "_native")}
+        values = super()._shape(grizz)
+
+        name = native.get("name")
+        if name:
+            values[self._name_slug] = name
+        email = native.get("email")
+        if email:
+            values[self._email_slug] = [email]
+        phone = _to_e164(native.get("phone"))
+        if phone:
+            values[self._phone_slug] = [{"original_phone_number": phone}]
+        company_rid = native.get("company_record_id")
+        if company_rid:
+            values[self._company_ref_slug] = [
+                {"target_object": "companies", "target_record_id": company_rid}
+            ]
+        return values
+
+    def _update_one(self, r: dict) -> dict:
+        record_id = r["Id"]
+        try:
+            resp = self._write(
+                "PATCH", f"{_BASE_URL}/v2/objects/{self._OBJECT}/records/{record_id}", r)
+            resp.raise_for_status()
+            return {"id": record_id, "success": True, "errors": []}
+        except Exception as e:  # isolate ANY per-record failure, never abort the batch
+            return {"id": record_id, "success": False, "errors": [self._err(e)]}
+
+    def _create_one(self, r: dict) -> dict:
+        try:
+            resp = self._write("POST", f"{_BASE_URL}/v2/objects/{self._OBJECT}/records", r)
+            new_id = resp.json().get("data", {}).get("id", {}).get("record_id", "")
+            return {"id": new_id, "success": True, "errors": []}
+        except Exception as e:  # isolate ANY per-record failure, never abort the batch
+            return {"id": "", "success": False, "errors": [self._err(e)]}
+
+    def update_people(self, records: list[dict]) -> list[dict]:
+        """Update person records concurrently.  Each needs an 'Id'; per-record
+        failures are isolated."""
+        return self._parallel(records, self._update_one)
+
+    def create_people(self, records: list[dict]) -> list[dict]:
+        """Create person records concurrently.  Per-record failures are isolated."""
         return self._parallel(records, self._create_one)

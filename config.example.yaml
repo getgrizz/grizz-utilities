@@ -119,9 +119,14 @@ attio:
     # ── Contact & Location ─────────────────────────────────────────────────────
     phone:                 grizz_phone
     email:                 grizz_email
-    city:                  grizz_city
-    state_province_region: grizz_state
-    country:               grizz_country
+    # Attio location attributes are OBJECT-TYPED — one attribute holds
+    # city + region + country. Map the three source fields to sub-fields of a
+    # single location attribute (dotted slug) and the tool collapses them into
+    # one Attio location value on write. Point them at the native
+    # `primary_location` instead to populate Attio's built-in location attribute.
+    city:                  grizz_location.locality
+    state_province_region: grizz_location.region
+    country:               grizz_location.country_code
 
     # ── Firmographics ──────────────────────────────────────────────────────────
     employee_range:        grizz_employee_range
@@ -141,3 +146,38 @@ attio:
 
     # ── Other Technology Signals ───────────────────────────────────────────────
     other_tech_signals:    grizz_other_tech_signals
+
+
+# ── Attio — People (contacts) ─────────────────────────────────────────────────
+# Used by `python run.py people sync --crm attio` — the client-side contact sync
+# (Attio is headless; there is no server-side contact endpoint).  Run
+# `python run.py setup --crm attio --object contacts` to create the grizz_contact_*
+# attributes below (setup reads THIS section, so it only creates what you map —
+# it never touches your Companies object).
+#
+# `*_field` are Attio's NATIVE People attributes (they already exist — setup never
+# creates them): the personal-name, the unique email dedup key, the phone list,
+# and the record-reference to Companies used to link each contact to its parent.
+# `field_mapping` are the grizz_* custom attributes; `gid` is the dedup id (matched
+# before email), and city/state/country collapse into one object-typed location
+# attribute exactly like companies do (map to native `primary_location` instead if
+# you prefer Attio's built-in).
+
+attio_contacts:
+  name_field:    name              # native personal-name
+  email_field:   email_addresses   # native unique attribute — the dedup key
+  phone_field:   phone_numbers     # native
+  company_ref:   company           # native record-reference to Companies (parent link)
+  # last_sync_field: grizz_contact_last_sync   # optional; stamped only with GRIZZ_STAMP_LAST_SYNC=1
+
+  field_mapping:
+    gid:          grizz_person_id       # dedup id — stamped on write, matched before email
+    title:        grizz_contact_title
+    seniority:    grizz_contact_seniority
+    department:   grizz_contact_function
+    persona:      grizz_contact_persona
+    linkedin_url: grizz_contact_linkedin
+    # location → ONE object-typed attribute (city/state/country collapse)
+    city:         grizz_contact_location.locality
+    state:        grizz_contact_location.region
+    country:      grizz_contact_location.country_code

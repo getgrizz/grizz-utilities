@@ -27,7 +27,8 @@ from rich.console import Console
 from rich.table import Table
 
 from grizz_enrichment import __version__, grizz_client
-from grizz_enrichment.adapters import ADAPTERS
+from grizz_enrichment.adapters import ADAPTERS, CONTACT_ADAPTERS
+from grizz_enrichment.adapters.attio import AttioAdapter, AttioContactAdapter
 from grizz_enrichment.audience_client import fetch_audience, submit as submit_audience
 from grizz_enrichment.grizz_client import enrich as grizz_enrich
 from grizz_enrichment.mapper import apply_mapping
@@ -1136,32 +1137,297 @@ def run_people_sync(crm: str, contacts_path: Path, enrich_email: bool, enrich_ph
                   f"parent_linked={agg['parent_linked']}  errors={agg['errors']}")
 
 
+# ── Attio contact sync (client-side, mirrors the company audience path) ─────────
+
+def _read_person_records(path: Path) -> list[dict]:
+    """Read FULL person records (not just gids) from a `people discover`
+    contacts.json.  The client-side Attio contact write puts name / title /
+    location / linkedin on the record, so it needs the whole member dict — a
+    bare gid list carries none of that."""
+    if path.suffix.lower() != ".json":
+        console.print("[red]Attio contact sync needs the rich contacts.json from "
+                      "`people discover`[/red] (name/title/location live there), "
+                      "not a gid list.")
+        raise typer.Exit(1)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        console.print(f"[red]{path} is not a contacts.json array.[/red]")
+        raise typer.Exit(1)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        gid = (c.get("gid") or c.get("gid_person") or "").strip()
+        key = gid or (c.get("linkedin_url") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _person_name(p: dict) -> dict | None:
+    """Build Attio's personal-name object from a discovered person, or None when
+    there's no name to write."""
+    first = (p.get("first_name") or "").strip()
+    last = (p.get("last_name") or "").strip()
+    full = " ".join(x for x in (first, last) if x).strip()
+    if not full:
+        return None
+    return {"first_name": first, "last_name": last, "full_name": full}
+
+
+def _enrich_people_map(api_key: str, gids: list[str], enrich_email: bool, enrich_phone: bool,
+                       batch_size: int, poll_interval: int, poll_timeout: int) -> dict:
+    """Enrich email/phone in chunks and RETURN {gid: {'email':.., 'phone':..}} so
+    the client-side Attio write can put fresh email/phone on the person record.
+
+    Same settle-aware, chunked polling as the server-path enrich — only values
+    from settled chunks are returned; an unsettled chunk is called out for a
+    re-run (already-entitled contacts are never re-charged)."""
+    want = ", ".join(f for f, on in (("email", enrich_email), ("phone", enrich_phone)) if on)
+    n_batches = (len(gids) + batch_size - 1) // batch_size
+    console.print(f"Enriching [bold]{want}[/bold] for {len(gids)} contact(s) in "
+                  f"{n_batches} chunk(s) of {batch_size} (spends credits).")
+    out: dict[str, dict] = {}
+    incomplete = 0
+    for bi in range(0, len(gids), batch_size):
+        chunk = gids[bi:bi + batch_size]
+        n = bi // batch_size + 1
+        console.print(f"[{n}/{n_batches}] enriching {len(chunk)}...", end=" ")
+        sub = grizz_client.enrich_contacts_batch(api_key, chunk,
+                                                 include_email=enrich_email,
+                                                 include_phone=enrich_phone)
+        final = _poll_until_terminal(
+            lambda: grizz_client.check_person_enrich_batch(api_key, sub.get("request_id")),
+            poll_interval, poll_timeout) or {}
+        settled = bool(final.get("settled")) or final.get("status") == "COMPLETE"
+        for r in (final.get("results") or []):
+            g = r.get("gid")
+            if not g:
+                continue
+            got = out.setdefault(str(g), {})
+            if r.get("email"):
+                got["email"] = r["email"]
+            if r.get("phone"):
+                got["phone"] = r["phone"]
+        if settled:
+            console.print(f"[green]complete[/green] — found_email={final.get('found_email', 0)} "
+                          f"found_phone={final.get('found_phone', 0)}")
+        else:
+            incomplete += 1
+            console.print("[yellow]still running — re-run to settle.[/yellow]")
+    if incomplete:
+        console.print(f"[yellow]{incomplete} chunk(s) did not settle[/yellow] — re-run the same "
+                      "command later; already-entitled contacts are free.")
+    return out
+
+
+def _resolve_attio_parent_companies(records: list[dict]) -> dict:
+    """Resolve company_gid → Attio company record_id for people whose input row
+    didn't already carry a crm_company_record_id, so the person can still be
+    linked to its parent company.  Best-effort — a company not in Attio just
+    means that person syncs without the link."""
+    need = [str(r.get("company_gid")) for r in records
+            if r.get("company_gid") and not (r.get("crm_company_record_id") or "").strip()]
+    if not need:
+        return {}
+    ca = AttioAdapter()
+    try:
+        ca.connect()
+        return ca.gid_to_record_ids(need)
+    except Exception as e:
+        console.print(f"  [yellow]Could not resolve parent companies ({e}); "
+                      "affected contacts sync without the company link.[/yellow]")
+        return {}
+
+
+def _write_people_batches(adapter, records: list[dict], kind: str, batch_size: int) -> int:
+    """Write person records (create or update) in batches, reporting per batch.
+    The adapter parallelizes each batch internally (Attio has no batch-write
+    API); batching here just keeps the console output readable."""
+    if not records:
+        return 0
+    fn = adapter.update_people if kind == "update" else adapter.create_people
+    total = len(records)
+    ok = 0
+    for bs in range(0, total, batch_size):
+        batch = records[bs:bs + batch_size]
+        be = min(bs + batch_size, total)
+        console.print(f"  {kind} {bs + 1}–{be} of {total}...", end=" ")
+        results = fn(batch)
+        b_ok = sum(1 for r in results if r.get("success"))
+        ok += b_ok
+        b_fail = len(results) - b_ok
+        if b_fail:
+            console.print(f"[green]{b_ok} ok[/green], [red]{b_fail} failed.[/red]")
+            for r in results:
+                if not r.get("success"):
+                    console.print(f"    [red]{r.get('errors')}[/red]")
+        else:
+            console.print(f"[green]{b_ok} ok.[/green]")
+    return ok
+
+
+def run_attio_people_sync(config_path: Path, contacts_path: Path,
+                          enrich_email: bool, enrich_phone: bool, enrich_batch_size: int,
+                          poll_interval: int, poll_timeout: int,
+                          batch_size: int, dry_run: bool, assume_yes: bool) -> None:
+    """Push discovered contacts into Attio via the SAME client-side model as the
+    company `audience` path: a local Attio REST adapter, config.yaml-driven, that
+    collapses city/state/country into ONE object-typed location attribute.
+
+    Bypasses the server `/people/create-crm/` endpoint (HubSpot/Salesforce-only,
+    and it emits three separate location fields).  Matches each contact to an
+    existing Attio person by the Grizz person gid then native email (updating in
+    place, never duplicating), links it to its parent company record, and writes
+    the native name/email/phone plus the mapped grizz_contact_* attributes."""
+    config = load_config(config_path)
+    cc = config.get("attio_contacts")
+    if not cc or not cc.get("field_mapping"):
+        console.print("[red]No 'attio_contacts' section in your config.[/red] Copy it from "
+                      "[bold]config.example.yaml[/bold] and set your People attribute slugs.")
+        raise typer.Exit(1)
+    field_mapping: dict = cc["field_mapping"]
+    native = {
+        "name":        cc.get("name_field", "name"),
+        "email":       cc.get("email_field", "email_addresses"),
+        "phone":       cc.get("phone_field", "phone_numbers"),
+        "company_ref": cc.get("company_ref", "company"),
+    }
+    person_id_slug = field_mapping.get("gid")
+
+    records = _read_person_records(contacts_path)
+    if not records:
+        console.print(f"[red]No contacts found in {contacts_path}.[/red]")
+        raise typer.Exit(1)
+    console.print(f"Loaded [bold]{len(records)}[/bold] contact(s) from {contacts_path}; "
+                  f"CRM=[bold]attio[/bold] (client-side write via ATTIO_API_KEY).")
+
+    # ── optional enrichment (spends credits; needs the Grizz key) ────────────
+    if enrich_email or enrich_phone:
+        api_key = os.environ.get("GRIZZ_API_KEY")
+        if not api_key:
+            console.print("[red]GRIZZ_API_KEY is not set.[/red] Needed for "
+                          "--enrich-email/--enrich-phone. Add it to your [bold].env[/bold].")
+            raise typer.Exit(1)
+        gids = [str(r.get("gid")) for r in records if r.get("gid")]
+        enriched = _enrich_people_map(api_key, gids, enrich_email, enrich_phone,
+                                      enrich_batch_size, poll_interval, poll_timeout)
+        for r in records:
+            got = enriched.get(str(r.get("gid"))) or {}
+            if got.get("email"):
+                r["email"] = got["email"]
+            if got.get("phone"):
+                r["phone"] = got["phone"]
+
+    # ── connect the People adapter ───────────────────────────────────────────
+    adapter = AttioContactAdapter()
+    console.print("Connecting to Attio...", end=" ")
+    try:
+        adapter.connect()
+    except Exception as e:
+        console.print(f"\n[red]Connection failed: {e}[/red]")
+        raise typer.Exit(1)
+    adapter.use_native_slugs(name=native["name"], email=native["email"],
+                             phone=native["phone"], company_ref=native["company_ref"],
+                             person_id=person_id_slug, last_sync=cc.get("last_sync_field"))
+    console.print("[green]connected.[/green]")
+
+    # ── resolve parent-company record ids for the native company reference ───
+    parent_by_gid = _resolve_attio_parent_companies(records)
+
+    # ── match discovered people to existing Attio person records ─────────────
+    console.print(f"Matching {len(records)} contact(s) to existing Attio people...")
+    try:
+        match = adapter.find_people_bulk(records)
+    except Exception as e:
+        console.print(f"  [red]Bulk lookup failed: {e}[/red]")
+        match = {}
+
+    to_update: list[dict] = []
+    to_create: list[dict] = []
+    linked = unlinked = 0
+    for p in records:
+        gid = str(p.get("gid") or "")
+        email = (p.get("email") or "").strip().lower()
+        rid = (match.get(gid) if gid else None) or (match.get(email) if email else None)
+        company_rid = ((p.get("crm_company_record_id") or "").strip()
+                       or parent_by_gid.get(str(p.get("company_gid"))))
+        if company_rid:
+            linked += 1
+        else:
+            unlinked += 1
+        rec = {
+            "_native": {
+                "name":              _person_name(p),
+                "email":             p.get("email"),
+                "phone":             p.get("phone"),
+                "company_record_id": company_rid or None,
+            },
+            **apply_mapping(p, field_mapping),
+        }
+        if rid:
+            rec["Id"] = rid
+            to_update.append(rec)
+        else:
+            to_create.append(rec)
+
+    console.print(f"  [green]{len(to_update)} matched[/green]  "
+                  f"[yellow]{len(to_create)} new[/yellow]  "
+                  f"(parent linked: {linked}, no parent: {unlinked})")
+    console.print()
+
+    if dry_run:
+        for r in (to_update[:20] + to_create[:20]):
+            kind = "update" if r.get("Id") else "create"
+            console.print(f"  [dim]{kind}: {[k for k in r if k not in ('Id', '_native')]}[/dim]")
+        console.print(f"[yellow]Dry run — {len(to_update)} update / {len(to_create)} create; "
+                      f"not writing to Attio.[/yellow]")
+        return
+
+    updated = _write_people_batches(adapter, to_update, "update", batch_size)
+    created = _write_people_batches(adapter, to_create, "create", batch_size)
+    console.print(f"\n[bold green]Done.[/bold green] updated={updated}  created={created}  "
+                  f"parent_linked={linked}  no_parent={unlinked}")
+
+
 @people_app.command("sync")
 def people_sync(
-    crm: str = typer.Option(..., "--crm", help="hubspot or salesforce"),
-    contacts: Path = typer.Option(..., "--contacts", help="contacts.json from `people discover`, or a CSV/txt of person gids"),
+    crm: str = typer.Option(..., "--crm", help="hubspot, salesforce, or attio"),
+    contacts: Path = typer.Option(..., "--contacts", help="contacts.json from `people discover` (required for attio); or a CSV/txt of person gids (hubspot/salesforce)"),
+    config: Path = typer.Option(Path("config.yaml"), "--config", help="Path to your config.yaml (attio only — reads the attio_contacts mapping)."),
     enrich_email: bool = typer.Option(False, "--enrich-email", help="Enrich work email before sync (spends credits)"),
     enrich_phone: bool = typer.Option(False, "--enrich-phone", help="Enrich phone before sync (spends credits)"),
     enrich_batch_size: int = typer.Option(50, "--enrich-batch-size", help="Contacts per enrich chunk (<=50 keeps each chunk inside the poll window)."),
     poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
     poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running the same command (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (the upstream provider retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
+    batch_size: int = typer.Option(100, "--batch-size", help="Person records per write batch (attio only; the adapter parallelizes each batch)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive (attio only)."),
 ):
-    """Push discovered contacts to your CRM — server-side create-OR-update.
+    """Push discovered contacts to your CRM — create-OR-update, never duplicating.
 
-    Each contact is matched against its parent account's existing CRM contacts
-    (gid_person → email → linkedin → name) and updated in place when found,
-    created otherwise — so a re-sync or an email-less existing contact isn't
-    duplicated.  The CRM key rides in the request body as `credentials` (from
-    .env); only the Grizz key is a Bearer header.  Discovery is free; email/phone
-    enrichment (--enrich-email/--enrich-phone) is a separate, paid step run in
-    chunks — it reports each chunk as complete only once every contact settles,
-    never mid-flight.
+    HubSpot / Salesforce go through the server `/people/create-crm/` endpoint,
+    which matches each contact against its parent account's existing CRM contacts
+    (gid_person → email → linkedin → name).  Attio is headless, so it syncs
+    CLIENT-SIDE via the local Attio REST adapter — the same model as the company
+    `audience` flow, driven by the `attio_contacts` mapping in config.yaml, and it
+    collapses city/state/country into ONE object-typed location attribute (there
+    is no server-side Attio contact endpoint).  Discovery is free; email/phone
+    enrichment (--enrich-email/--enrich-phone) is a separate, paid step.
     """
     if not contacts.exists():
         console.print(f"[red]Contacts file not found: {contacts}[/red]")
         raise typer.Exit(1)
+    crm = crm.strip().lower()
     enrich_batch_size = max(1, min(enrich_batch_size, 100))
+    if crm in CONTACT_ADAPTERS:   # attio — client-side, config-driven People write
+        run_attio_people_sync(config, contacts, enrich_email, enrich_phone,
+                              enrich_batch_size, poll_interval, poll_timeout,
+                              max(1, min(batch_size, 200)), dry_run, yes)
+        return
     run_people_sync(crm, contacts, enrich_email, enrich_phone, enrich_batch_size,
                     poll_interval, poll_timeout, dry_run)
 
@@ -1221,21 +1487,21 @@ def audience(
                  batch_size=batch_size, gids=gid_list, assume_yes=yes)
 
 
-def _run_setup(crm: str, contacts: bool, dry_run: bool) -> None:
-    """Route to the company or contact setup for the chosen CRM.  The contact
-    setups provision exactly the grizz_contact_* properties create-crm writes —
-    identical to what the `setup_crm_contacts` MCP tool creates."""
+def _run_setup(crm: str, contacts: bool, dry_run: bool, config_path: Path) -> None:
+    """Route to the company or contact setup for the chosen CRM.  The Salesforce/
+    HubSpot contact setups provision exactly the grizz_contact_* properties
+    create-crm writes — identical to what the `setup_crm_contacts` MCP tool
+    creates.  Attio is CONFIG-DRIVEN: it provisions only the attributes mapped in
+    config.yaml, on just the one object requested, so contact setup never touches
+    the Companies object (and vice versa)."""
     if crm == "salesforce":
         (run_setup_salesforce_contacts if contacts else run_setup_salesforce)(dry_run=dry_run)
     elif crm == "hubspot":
         (run_setup_hubspot_contacts if contacts else run_setup_hubspot)(dry_run=dry_run)
     elif crm == "attio":
-        # Attio provisions company + people attributes together from the Grizz
-        # catalog, so one setup run covers both objects.
-        if contacts:
-            console.print("[dim]Attio provisions company + contact attributes together — "
-                          "running the full catalog setup.[/dim]")
-        run_setup_attio(dry_run=dry_run)
+        run_setup_attio(dry_run=dry_run,
+                        object_="contacts" if contacts else "company",
+                        config_path=config_path)
     else:
         console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
         raise typer.Exit(1)
@@ -1245,14 +1511,25 @@ def _run_setup(crm: str, contacts: bool, dry_run: bool) -> None:
 def setup(
     crm: str = typer.Option("salesforce", help="CRM to set up"),
     object_: str = typer.Option("company", "--object", help="Which records to set up: 'company' or 'contacts'"),
+    config: Path = typer.Option(Path("config.yaml"), "--config", help="Path to your config.yaml (Attio reads its slugs from here)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without creating fields"),
 ):
-    """Create all recommended Grizz custom fields in your CRM (company or contact records)."""
+    """Create the Grizz custom fields in your CRM (company or contact records).
+
+    For Attio this reads config.yaml and creates only the attributes you map —
+    so it never duplicates fields you already built or renamed, and `--object
+    contacts` provisions the People object without touching Companies.
+    """
     obj = object_.strip().lower()
     if obj not in ("company", "companies", "contact", "contacts"):
         console.print(f"[red]--object must be 'company' or 'contacts' (got '{object_}').[/red]")
         raise typer.Exit(1)
-    _run_setup(crm, contacts=obj in ("contact", "contacts"), dry_run=dry_run)
+    try:
+        _run_setup(crm, contacts=obj in ("contact", "contacts"), dry_run=dry_run,
+                   config_path=config)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)
@@ -1296,7 +1573,12 @@ def main(ctx: typer.Context) -> None:
             default=False,
         ).ask()
         console.print()
-        _run_setup(crm, contacts=(which == "Contact fields"), dry_run=bool(dry_run))
+        try:
+            _run_setup(crm, contacts=(which == "Contact fields"),
+                       dry_run=bool(dry_run), config_path=Path("config.yaml"))
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
         return
 
     if action == "Enrich accounts from CSV":
