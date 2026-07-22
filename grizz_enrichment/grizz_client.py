@@ -322,6 +322,40 @@ def create_in_crm_contacts(
     return resp.json()
 
 
+def prepare_contact_writes(
+    api_key: str,
+    crm: str,
+    records: list[dict],
+    crm_contacts: list[dict],
+    field_mapping: dict | None = None,
+) -> dict:
+    """Headless, account-scoped contact MATCHING for Attio (POST
+    /api/v1/people/prepare-writes/).  Grizz performs NO CRM I/O — the caller
+    passes the parent account's existing CRM contacts (`crm_contacts`, read from
+    Attio) and Grizz runs the SAME dedup cascade the HubSpot/Salesforce server
+    path uses (grizz_person_id → email → linkedin → fuzzy name), returning per
+    input record whether it matches an existing contact.
+
+    `records`      — [{gid_person|primary_email|linkedin_url, first_name,
+                       last_name, title, gid_company}], ≤200 per call.
+    `crm_contacts` — the account's existing people:
+                     [{record_id, first_name, last_name, email_addresses,
+                       linkedin_url, grizz_person_id}].
+
+    Returns {crm, object, total, prepared, no_grizz_match, matched_existing,
+    new_contacts, records:[{matched, crm_match:{record_id, match_via,
+    confidence}|null, values, on_create_values, parent}]}.  `records` is 1:1 and
+    in order with the input `records`.  match_via "fuzzy" carries a confidence the
+    caller should verify before merging (don't silently merge)."""
+    payload: dict = {"crm": crm, "records": records, "crm_contacts": crm_contacts}
+    if field_mapping is not None:
+        payload["field_mapping"] = field_mapping
+    url = f"{BASE_URL}/api/v1/people/prepare-writes/"
+    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=120)
+    _raise_with_body(resp)
+    return resp.json()
+
+
 def check_crm_write_request(api_key: str, request_id: str) -> dict:
     """Pair of the `check_crm_write_request` MCP tool — poll a CRM write job.
 

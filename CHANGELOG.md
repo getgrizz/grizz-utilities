@@ -10,6 +10,17 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Robust Attio contact dedup — reuses the server cascade.** `people sync --crm
+  attio` no longer matches on just gid+email. It now runs the SAME dedup logic as
+  the HubSpot/Salesforce paths: a global strong-key match (grizz_person_id, email)
+  plus an ACCOUNT-SCOPED cascade via the server `people/prepare-writes/` endpoint
+  (grizz_person_id → email → linkedin → decomposed fuzzy name — surname-exact +
+  generational-suffix-equal + first-name ≥0.85, skipping already-stamped records).
+  The client reads each parent company's existing Attio people and passes them in;
+  Grizz does the matching (single source of truth, so Attio stays in lock-step
+  with the other CRMs). Fuzzy matches below `--fuzzy-threshold` (default 0.9) are
+  surfaced for manual review, never silently merged. Matching is scoped to the
+  parent company, so people at different companies can't collide on a name.
 - **`people sync --crm attio`** — client-side contact sync for Attio, mirroring the
   company `audience` flow instead of the server `/people/create-crm/` endpoint
   (which is HubSpot/Salesforce-only). Reads a `people discover` `contacts.json`,

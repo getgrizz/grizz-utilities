@@ -490,23 +490,59 @@ class AttioContactAdapter(_AttioBase):
     _phone_slug = "phone_numbers"
     _company_ref_slug = "company"
     _person_id_slug: str | None = None   # the grizz person-gid attribute, if mapped
+    _linkedin_slug: str | None = None    # the grizz linkedin attribute, if mapped
 
     def use_native_slugs(self, *, name: str, email: str, phone: str,
                          company_ref: str, person_id: str | None,
-                         last_sync: str | None = None, phone_slugs=None) -> None:
+                         last_sync: str | None = None, phone_slugs=None,
+                         linkedin: str | None = None) -> None:
         """Point the adapter at this workspace's native People attribute slugs
-        (from config.yaml) and the grizz person-id attribute used for dedup.
-        `phone_slugs` are the config-declared phone-number attributes to
+        (from config.yaml) and the grizz person-id / linkedin attributes used for
+        dedup.  `phone_slugs` are the config-declared phone-number attributes to
         E.164-normalize on write (in addition to the built-in defaults)."""
         self._name_slug = name
         self._email_slug = email
         self._phone_slug = phone
         self._company_ref_slug = company_ref
         self._person_id_slug = person_id
+        self._linkedin_slug = linkedin
         if last_sync:
             self._LAST_SYNC = last_sync
         if phone_slugs:
             self.set_phone_slugs(phone_slugs)
+
+    def fetch_people_by_company(self, company_record_id: str) -> list[dict]:
+        """Read the existing Attio people linked to one company record, normalized
+        to the account-scoped candidate shape the server's prepare-writes cascade
+        expects: {record_id, first_name, last_name, email_addresses, linkedin_url,
+        grizz_person_id}.  This is the account-scoped candidate set — matching is
+        bounded to a company's own contacts so people at different companies can't
+        collide on a name."""
+        recs = self._query({self._company_ref_slug: {"target_record_id": company_record_id}})
+        out: list[dict] = []
+        for rec in recs:
+            vals = rec.get("values", {})
+            nm = vals.get(self._name_slug) or []
+            nm0 = (nm[0] if isinstance(nm, list) and nm else nm) if nm else {}
+            first = (nm0.get("first_name") if isinstance(nm0, dict) else "") or ""
+            last = (nm0.get("last_name") if isinstance(nm0, dict) else "") or ""
+            emails = []
+            for e in (vals.get(self._email_slug) or []):
+                addr = e.get("email_address") or e.get("value") if isinstance(e, dict) else e
+                if addr:
+                    emails.append(addr)
+            linkedin = (_first(vals.get(self._linkedin_slug)) if self._linkedin_slug else None) \
+                or _first(vals.get("linkedin")) or ""
+            grizz_pid = (_first(vals.get(self._person_id_slug)) if self._person_id_slug else None) or ""
+            out.append({
+                "record_id":       rec["id"]["record_id"],
+                "first_name":      first,
+                "last_name":       last,
+                "email_addresses": emails,
+                "linkedin_url":    linkedin,
+                "grizz_person_id": grizz_pid,
+            })
+        return out
         # phone + company-ref are non-essential typed lists — safe to drop on a
         # 400 so the rest of the record still lands. email is the dedup key and
         # name is a dict (already covered by _write), so neither is auto-dropped.

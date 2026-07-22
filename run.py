@@ -1237,6 +1237,100 @@ def _enrich_people_map(api_key: str, gids: list[str], enrich_email: bool, enrich
     return out
 
 
+def _attio_person_input(p: dict) -> dict:
+    """Shape a discovered person into the prepare-writes input record."""
+    return {
+        "gid_person":    p.get("gid"),
+        "primary_email": p.get("email"),
+        "linkedin_url":  p.get("linkedin_url"),
+        "first_name":    p.get("first_name"),
+        "last_name":     p.get("last_name"),
+        "title":         p.get("title"),
+        "gid_company":   p.get("company_gid"),
+    }
+
+
+def _attio_parent_rid(p: dict, parent_by_gid: dict) -> str:
+    """The Attio company record id a contact links to (explicit crm id, else
+    resolved from its gid_company); '' if unresolved."""
+    return ((p.get("crm_company_record_id") or "").strip()
+            or parent_by_gid.get(str(p.get("company_gid"))) or "")
+
+
+def _match_attio_people(adapter, api_key: str, records: list[dict],
+                        parent_by_gid: dict, fuzzy_threshold: float) -> list[tuple]:
+    """Decide per person whether to update an existing Attio contact or create a
+    new one, mirroring the server's dedup in two layers:
+
+      1. GLOBAL strong keys (grizz_person_id, email) — safe across account moves
+         and prevents re-run duplicates.
+      2. ACCOUNT-SCOPED cascade via the server's prepare-writes endpoint (the SAME
+         grizz_person_id → email → linkedin → fuzzy-name logic HubSpot/Salesforce
+         use) for anyone the strong keys didn't catch — matching is bounded to the
+         parent company's own contacts, so people at different companies can't
+         collide on a name.
+
+    Returns a list of (kind, record_id, match_via, confidence) 1:1 with `records`;
+    kind is 'update' | 'create' | 'review' (a fuzzy match below fuzzy_threshold —
+    surfaced for manual review, never silently merged)."""
+    n = len(records)
+    result: list = [None] * n
+
+    # Phase 1 — global strong-key match (grizz_person_id, native email)
+    try:
+        strong = adapter.find_people_bulk(records)
+    except Exception as e:
+        console.print(f"  [yellow]strong-key lookup failed ({e}); relying on the "
+                      f"account-scoped cascade.[/yellow]")
+        strong = {}
+
+    groups: dict[str, list[int]] = {}
+    for i, p in enumerate(records):
+        gid = str(p.get("gid") or "")
+        email = (p.get("email") or "").strip().lower()
+        rid = (strong.get(gid) if gid else None) or (strong.get(email) if email else None)
+        if rid:
+            result[i] = ("update", rid, "strong", 1.0)
+        elif _attio_parent_rid(p, parent_by_gid):
+            groups.setdefault(_attio_parent_rid(p, parent_by_gid), []).append(i)
+        else:
+            result[i] = ("create", None, None, None)   # no strong match, no parent
+
+    # Phase 2 — account-scoped prepare-writes for the rest
+    for prid, idxs in groups.items():
+        try:
+            cands = adapter.fetch_people_by_company(prid)
+        except Exception as e:
+            console.print(f"  [yellow]could not read a company's existing contacts "
+                          f"({e}); its unmatched contacts will be created new.[/yellow]")
+            for i in idxs:
+                result[i] = ("create", None, None, None)
+            continue
+        for j in range(0, len(idxs), 200):      # prepare-writes caps at 200/call
+            chunk = idxs[j:j + 200]
+            try:
+                resp = grizz_client.prepare_contact_writes(
+                    api_key, "attio", [_attio_person_input(records[i]) for i in chunk], cands)
+                rows = resp.get("records", [])
+            except Exception as e:
+                console.print(f"  [yellow]prepare-writes failed ({e}); that account's "
+                              f"contacts will be created new.[/yellow]")
+                rows = []
+            for k, i in enumerate(chunk):
+                r = rows[k] if k < len(rows) else {}
+                cm = r.get("crm_match") if r.get("matched") else None
+                if cm and cm.get("record_id"):
+                    via = cm.get("match_via")
+                    conf = cm.get("confidence") or 0.0
+                    if via == "fuzzy" and conf < fuzzy_threshold:
+                        result[i] = ("review", cm["record_id"], via, conf)
+                    else:
+                        result[i] = ("update", cm["record_id"], via, conf)
+                else:
+                    result[i] = ("create", None, None, None)
+    return result
+
+
 def _resolve_attio_parent_companies(records: list[dict]) -> dict:
     """Resolve company_gid → Attio company record_id for people whose input row
     didn't already carry a crm_company_record_id, so the person can still be
@@ -1286,17 +1380,20 @@ def _write_people_batches(adapter, records: list[dict], kind: str, batch_size: i
 def run_attio_people_sync(config_path: Path, contacts_path: Path,
                           enrich_email: bool, enrich_phone: bool, enrich_batch_size: int,
                           poll_interval: int, poll_timeout: int,
-                          batch_size: int, dry_run: bool, assume_yes: bool) -> None:
+                          batch_size: int, dry_run: bool, assume_yes: bool,
+                          fuzzy_threshold: float = 0.9) -> None:
     """Push discovered contacts into Attio via the SAME client-side model as the
     company `audience` path: a local Attio REST adapter, config.yaml-driven, that
     collapses city/state/country into ONE object-typed location attribute.
 
-    Bypasses the server `/people/create-crm/` endpoint (HubSpot/Salesforce-only,
-    and it emits three separate location fields).  Matches each contact to an
-    existing Attio person by the Grizz person gid then native email (updating in
-    place, never duplicating).  Per the Grizz write principle it writes ONLY the
-    grizz_contact_* attributes on an existing contact; the native name/email/phone
-    and the parent-company link are seeded ONLY when creating a new person."""
+    Dedup mirrors the HubSpot/Salesforce server path: a global strong-key match
+    (grizz_person_id, email) plus an ACCOUNT-SCOPED cascade run through the
+    server's prepare-writes endpoint — the SAME grizz_person_id → email → linkedin
+    → fuzzy-name logic — so an existing contact is updated in place, not
+    duplicated. Per the Grizz write principle it writes ONLY the grizz_contact_*
+    attributes on an existing contact; the native name/email/phone and the
+    parent-company link are seeded ONLY when creating a new person. Fuzzy matches
+    below `fuzzy_threshold` are surfaced for review, never silently merged."""
     config = load_config(config_path)
     cc = config.get("attio_contacts")
     if not cc or not cc.get("field_mapping"):
@@ -1312,6 +1409,13 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
     }
     person_id_slug = field_mapping.get("gid")
 
+    # Grizz key is required — dedup matching runs server-side (prepare-writes).
+    api_key = os.environ.get("GRIZZ_API_KEY")
+    if not api_key:
+        console.print("[red]GRIZZ_API_KEY is not set.[/red] Needed for contact dedup "
+                      "matching (and enrichment). Add it to your [bold].env[/bold].")
+        raise typer.Exit(1)
+
     records = _read_person_records(contacts_path)
     if not records:
         console.print(f"[red]No contacts found in {contacts_path}.[/red]")
@@ -1319,13 +1423,8 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
     console.print(f"Loaded [bold]{len(records)}[/bold] contact(s) from {contacts_path}; "
                   f"CRM=[bold]attio[/bold] (client-side write via ATTIO_API_KEY).")
 
-    # ── optional enrichment (spends credits; needs the Grizz key) ────────────
+    # ── optional enrichment (spends credits) ─────────────────────────────────
     if enrich_email or enrich_phone:
-        api_key = os.environ.get("GRIZZ_API_KEY")
-        if not api_key:
-            console.print("[red]GRIZZ_API_KEY is not set.[/red] Needed for "
-                          "--enrich-email/--enrich-phone. Add it to your [bold].env[/bold].")
-            raise typer.Exit(1)
         gids = [str(r.get("gid")) for r in records if r.get("gid")]
         enriched = _enrich_people_map(api_key, gids, enrich_email, enrich_phone,
                                       enrich_batch_size, poll_interval, poll_timeout)
@@ -1347,38 +1446,36 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
     adapter.use_native_slugs(name=native["name"], email=native["email"],
                              phone=native["phone"], company_ref=native["company_ref"],
                              person_id=person_id_slug, last_sync=cc.get("last_sync_field"),
-                             phone_slugs=_attio_phone_slugs(cc))
+                             phone_slugs=_attio_phone_slugs(cc),
+                             linkedin=field_mapping.get("linkedin_url"))
     console.print("[green]connected.[/green]")
 
-    # ── resolve parent-company record ids for the native company reference ───
+    # ── resolve parent-company record ids (for scoping + the company link) ───
     parent_by_gid = _resolve_attio_parent_companies(records)
 
-    # ── match discovered people to existing Attio person records ─────────────
-    console.print(f"Matching {len(records)} contact(s) to existing Attio people...")
-    try:
-        match = adapter.find_people_bulk(records)
-    except Exception as e:
-        console.print(f"  [red]Bulk lookup failed: {e}[/red]")
-        match = {}
+    # ── match: global strong keys + account-scoped cascade (prepare-writes) ──
+    console.print(f"Matching {len(records)} contact(s) — strong keys + account-scoped "
+                  f"cascade (grizz_person_id → email → linkedin → name)...")
+    decisions = _match_attio_people(adapter, api_key, records, parent_by_gid, fuzzy_threshold)
 
     to_update: list[dict] = []
     to_create: list[dict] = []
+    review: list[tuple] = []
     linked = 0
-    for p in records:
-        gid = str(p.get("gid") or "")
-        email = (p.get("email") or "").strip().lower()
-        rid = (match.get(gid) if gid else None) or (match.get(email) if email else None)
+    via_counts: dict[str, int] = {}
+    for i, p in enumerate(records):
+        kind, rid, via, conf = decisions[i]
         mapped = apply_mapping(p, field_mapping)
-        if rid:
-            # Existing contact — Grizz writes ONLY its grizz_* attributes; the
-            # native name/email/phone/company are left exactly as they are (we
-            # never overwrite native fields on a record Grizz didn't create).
+        if kind == "update":
+            # Existing contact — write ONLY grizz_* attributes (never touch native
+            # name/email/phone/company on a record Grizz didn't create).
             to_update.append({"Id": rid, **mapped})
+            via_counts[via] = via_counts.get(via, 0) + 1
+        elif kind == "review":
+            review.append((p, rid, conf))   # possible (fuzzy) dup — do NOT merge
         else:
-            # New record — seed the native fields too (name/email/phone + the
-            # parent-company link); the grizz_* attributes carry the same data.
-            company_rid = ((p.get("crm_company_record_id") or "").strip()
-                           or parent_by_gid.get(str(p.get("company_gid"))))
+            # New record — seed the native fields too (name/email/phone + parent link).
+            company_rid = _attio_parent_rid(p, parent_by_gid)
             if company_rid:
                 linked += 1
             to_create.append({
@@ -1391,23 +1488,31 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
                 **mapped,
             })
 
-    console.print(f"  [green]{len(to_update)} matched[/green] (grizz_* only)  "
-                  f"[yellow]{len(to_create)} new[/yellow] (native + grizz_*, "
-                  f"parent linked: {linked})")
+    via_note = ", ".join(f"{k}:{v}" for k, v in via_counts.items()) or "—"
+    console.print(f"  [green]{len(to_update)} matched[/green] ({via_note})  "
+                  f"[yellow]{len(to_create)} new[/yellow] (parent linked: {linked})"
+                  + (f"  [magenta]{len(review)} fuzzy→review[/magenta]" if review else ""))
+    if review:
+        console.print(f"  [magenta]{len(review)} possible (fuzzy) match(es) below "
+                      f"--fuzzy-threshold {fuzzy_threshold} — NOT written[/magenta] "
+                      f"(merge in Attio, or lower the threshold to accept):")
+        for p, rid, conf in review[:10]:
+            nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            console.print(f"    [dim]{nm or p.get('gid')} → existing {rid} (conf {conf:.2f})[/dim]")
     console.print()
 
     if dry_run:
         for r in (to_update[:20] + to_create[:20]):
             kind = "update" if r.get("Id") else "create"
             console.print(f"  [dim]{kind}: {[k for k in r if k not in ('Id', '_native')]}[/dim]")
-        console.print(f"[yellow]Dry run — {len(to_update)} update / {len(to_create)} create; "
-                      f"not writing to Attio.[/yellow]")
+        console.print(f"[yellow]Dry run — {len(to_update)} update / {len(to_create)} create / "
+                      f"{len(review)} review; not writing to Attio.[/yellow]")
         return
 
     updated = _write_people_batches(adapter, to_update, "update", batch_size)
     created = _write_people_batches(adapter, to_create, "create", batch_size)
     console.print(f"\n[bold green]Done.[/bold green] updated={updated}  created={created}  "
-                  f"parent_linked={linked}")
+                  f"parent_linked={linked}  fuzzy_review={len(review)}")
 
 
 @people_app.command("sync")
@@ -1421,6 +1526,7 @@ def people_sync(
     poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
     poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running the same command (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (the upstream provider retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
     batch_size: int = typer.Option(100, "--batch-size", help="Person records per write batch (attio only; the adapter parallelizes each batch)."),
+    fuzzy_threshold: float = typer.Option(0.9, "--fuzzy-threshold", help="Attio only. Min confidence to auto-merge a FUZZY name match (grizz_person_id/email/linkedin matches always merge). Fuzzy matches below this are surfaced for review, not written. Set 0 to accept all, 1.01 to never auto-merge a fuzzy match."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive (attio only)."),
 ):
@@ -1430,10 +1536,11 @@ def people_sync(
     which matches each contact against its parent account's existing CRM contacts
     (gid_person → email → linkedin → name).  Attio is headless, so it syncs
     CLIENT-SIDE via the local Attio REST adapter — the same model as the company
-    `audience` flow, driven by the `attio_contacts` mapping in config.yaml, and it
-    collapses city/state/country into ONE object-typed location attribute (there
-    is no server-side Attio contact endpoint).  Discovery is free; email/phone
-    enrichment (--enrich-email/--enrich-phone) is a separate, paid step.
+    `audience` flow — but reuses the SAME server dedup cascade via prepare-writes
+    (global strong keys + an account-scoped grizz_person_id → email → linkedin →
+    fuzzy-name match), and collapses city/state/country into ONE object-typed
+    location attribute. Discovery is free; email/phone enrichment
+    (--enrich-email/--enrich-phone) is a separate, paid step.
     """
     if not contacts.exists():
         console.print(f"[red]Contacts file not found: {contacts}[/red]")
@@ -1443,7 +1550,8 @@ def people_sync(
     if crm in CONTACT_ADAPTERS:   # attio — client-side, config-driven People write
         run_attio_people_sync(config, contacts, enrich_email, enrich_phone,
                               enrich_batch_size, poll_interval, poll_timeout,
-                              max(1, min(batch_size, 200)), dry_run, yes)
+                              max(1, min(batch_size, 200)), dry_run, yes,
+                              fuzzy_threshold=fuzzy_threshold)
         return
     run_people_sync(crm, contacts, enrich_email, enrich_phone, enrich_batch_size,
                     poll_interval, poll_timeout, dry_run)

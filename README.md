@@ -354,9 +354,15 @@ python run.py people sync --crm attio --contacts people_out/contacts.json --enri
 ```
 
 The `attio_contacts:` section of `config.yaml` maps person fields to your Attio
-People attributes. `people sync --crm attio` matches each contact to an existing
-person (by the Grizz person gid, then native email — updating in place, never
-duplicating). Following the Grizz write principle, it writes **only the
+People attributes. Deduplication reuses the **same cascade as HubSpot/Salesforce**:
+a global strong-key match (grizz_person_id, email) plus an **account-scoped**
+`grizz_person_id → email → linkedin → fuzzy-name` match run server-side (the client
+reads each parent company's existing people and passes them to Grizz's
+`prepare-writes` endpoint, so the matching logic lives in one place). Matching is
+scoped to the parent company, so two people with the same name at different
+companies never collide; fuzzy name matches below `--fuzzy-threshold` (default 0.9)
+are surfaced for review rather than merged. Following the Grizz write principle, it
+writes **only the
 `grizz_contact_*` attributes** on an existing contact (including
 `grizz_contact_email`/`grizz_contact_phone`); the native name/email/phone and the
 parent-company link are seeded **only when creating a new person**, so Grizz never
