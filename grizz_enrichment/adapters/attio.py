@@ -463,8 +463,12 @@ class AttioContactAdapter(_AttioBase):
     attributes that need their own shaping (personal-name, email/phone lists, the
     Companies record-reference).  Their slugs are workspace-configurable, so they
     come from config.yaml via use_native_slugs() rather than being hardcoded.
-    Dedup is on the person's Grizz gid (a configured id attribute) first, then the
-    native unique email attribute — mirroring the company gid → domains cascade.
+    Per the Grizz write principle, those natives are only ever populated when
+    CREATING a new person — an existing contact is written with grizz_* attributes
+    ONLY (run.py passes '_native' on create records, omits it on updates), so
+    Grizz never overwrites a native field on a record it didn't create.  Dedup is
+    on the person's Grizz gid (a configured id attribute) first, then the native
+    unique email attribute — mirroring the company gid → domains cascade.
     """
 
     _OBJECT = "people"

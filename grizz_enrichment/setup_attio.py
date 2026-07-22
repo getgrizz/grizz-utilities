@@ -22,6 +22,12 @@ import os
 import requests
 import yaml
 
+# Reuse the ONE source of truth for which slugs are phone numbers, so setup types
+# them as Attio phone-number attributes (built-in cleansing/validation) exactly
+# the same way the adapter E.164-normalizes them on write — company and contact
+# phone fields share this set.
+from grizz_enrichment.adapters.attio import _PHONE_SLUGS
+
 _BASE_URL = "https://api.attio.com"
 _TIMEOUT = 30
 
@@ -54,24 +60,30 @@ def _plan_from_mapping(field_mapping: dict, skip: set[str]) -> list[dict]:
     """Turn a config field_mapping into the attribute specs to ensure exist.
 
     Dotted slugs (grizz_location.locality) collapse to ONE `location`-typed
-    attribute per prefix; every other mapped slug is a `text` attribute; native
-    slugs in `skip` (and the domain/`*_field` natives) are dropped."""
+    attribute per prefix; phone slugs (the shared `_PHONE_SLUGS` set, e.g.
+    grizz_phone / grizz_contact_phone) get Attio's `phone-number` type so the
+    field carries built-in cleansing; every other mapped slug is a `text`
+    attribute; native slugs in `skip` (and the domain/`*_field` natives) are
+    dropped."""
     location_attrs: list[str] = []       # object-typed, order-preserving, deduped
+    phone_attrs: list[str] = []
     text_attrs: list[str] = []
     seen: set[str] = set()
     for target in field_mapping.values():
         if not target or not isinstance(target, str):
             continue
         if "." in target:                # dotted sub-field → object-typed attribute
-            attr = target.split(".", 1)[0]
-            bucket, typ = location_attrs, "location"
+            attr, bucket = target.split(".", 1)[0], location_attrs
+        elif target in _PHONE_SLUGS:     # phone number → phone-number type (cleansing)
+            attr, bucket = target, phone_attrs
         else:
-            attr, bucket, typ = target, text_attrs, "text"
+            attr, bucket = target, text_attrs
         if attr in skip or attr in seen:
             continue
         seen.add(attr)
         bucket.append(attr)
     return ([{"api_slug": a, "title": _title(a), "type": "location"} for a in location_attrs]
+            + [{"api_slug": a, "title": _title(a), "type": "phone-number"} for a in phone_attrs]
             + [{"api_slug": a, "title": _title(a), "type": "text"} for a in text_attrs])
 
 

@@ -356,9 +356,12 @@ python run.py people sync --crm attio --contacts people_out/contacts.json --enri
 The `attio_contacts:` section of `config.yaml` maps person fields to your Attio
 People attributes. `people sync --crm attio` matches each contact to an existing
 person (by the Grizz person gid, then native email — updating in place, never
-duplicating), links it to its parent Company record, and writes the native
-name/email/phone plus the mapped `grizz_contact_*` attributes — with
-city/state/country collapsed into one location attribute, just like companies.
+duplicating). Following the Grizz write principle, it writes **only the
+`grizz_contact_*` attributes** on an existing contact (including
+`grizz_contact_email`/`grizz_contact_phone`); the native name/email/phone and the
+parent-company link are seeded **only when creating a new person**, so Grizz never
+overwrites a native field on a record it didn't create. City/state/country are
+collapsed into one location attribute, just like companies.
 
 > **Attio People scope.** For contacts, grant the `ATTIO_API_KEY` read/write on
 > **Objects → People** (records + attributes) in addition to Companies.

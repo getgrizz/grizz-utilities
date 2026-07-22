@@ -1281,8 +1281,9 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
     Bypasses the server `/people/create-crm/` endpoint (HubSpot/Salesforce-only,
     and it emits three separate location fields).  Matches each contact to an
     existing Attio person by the Grizz person gid then native email (updating in
-    place, never duplicating), links it to its parent company record, and writes
-    the native name/email/phone plus the mapped grizz_contact_* attributes."""
+    place, never duplicating).  Per the Grizz write principle it writes ONLY the
+    grizz_contact_* attributes on an existing contact; the native name/email/phone
+    and the parent-company link are seeded ONLY when creating a new person."""
     config = load_config(config_path)
     cc = config.get("attio_contacts")
     if not cc or not cc.get("field_mapping"):
@@ -1348,35 +1349,37 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
 
     to_update: list[dict] = []
     to_create: list[dict] = []
-    linked = unlinked = 0
+    linked = 0
     for p in records:
         gid = str(p.get("gid") or "")
         email = (p.get("email") or "").strip().lower()
         rid = (match.get(gid) if gid else None) or (match.get(email) if email else None)
-        company_rid = ((p.get("crm_company_record_id") or "").strip()
-                       or parent_by_gid.get(str(p.get("company_gid"))))
-        if company_rid:
-            linked += 1
-        else:
-            unlinked += 1
-        rec = {
-            "_native": {
-                "name":              _person_name(p),
-                "email":             p.get("email"),
-                "phone":             p.get("phone"),
-                "company_record_id": company_rid or None,
-            },
-            **apply_mapping(p, field_mapping),
-        }
+        mapped = apply_mapping(p, field_mapping)
         if rid:
-            rec["Id"] = rid
-            to_update.append(rec)
+            # Existing contact — Grizz writes ONLY its grizz_* attributes; the
+            # native name/email/phone/company are left exactly as they are (we
+            # never overwrite native fields on a record Grizz didn't create).
+            to_update.append({"Id": rid, **mapped})
         else:
-            to_create.append(rec)
+            # New record — seed the native fields too (name/email/phone + the
+            # parent-company link); the grizz_* attributes carry the same data.
+            company_rid = ((p.get("crm_company_record_id") or "").strip()
+                           or parent_by_gid.get(str(p.get("company_gid"))))
+            if company_rid:
+                linked += 1
+            to_create.append({
+                "_native": {
+                    "name":              _person_name(p),
+                    "email":             p.get("email"),
+                    "phone":             p.get("phone"),
+                    "company_record_id": company_rid or None,
+                },
+                **mapped,
+            })
 
-    console.print(f"  [green]{len(to_update)} matched[/green]  "
-                  f"[yellow]{len(to_create)} new[/yellow]  "
-                  f"(parent linked: {linked}, no parent: {unlinked})")
+    console.print(f"  [green]{len(to_update)} matched[/green] (grizz_* only)  "
+                  f"[yellow]{len(to_create)} new[/yellow] (native + grizz_*, "
+                  f"parent linked: {linked})")
     console.print()
 
     if dry_run:
@@ -1390,7 +1393,7 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
     updated = _write_people_batches(adapter, to_update, "update", batch_size)
     created = _write_people_batches(adapter, to_create, "create", batch_size)
     console.print(f"\n[bold green]Done.[/bold green] updated={updated}  created={created}  "
-                  f"parent_linked={linked}  no_parent={unlinked}")
+                  f"parent_linked={linked}")
 
 
 @people_app.command("sync")

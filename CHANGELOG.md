@@ -20,11 +20,15 @@ This project uses [Semantic Versioning](https://semver.org/).
   Attio-native shape — rather than three separate text fields. Matches each
   contact to an existing person by the Grizz person gid then native email
   (updates in place, never duplicates), links it to its parent Company record,
-  and writes the native name/email/phone alongside the mapped `grizz_contact_*`
-  attributes — including the parent company's `gid_company` on the person record
-  (`company_gid → grizz_contact_company_gid`) in addition to the native `company`
-  reference link. `--enrich-email`/`--enrich-phone` fetch fresh contact info first;
-  `--dry-run` resolves + counts without writing.
+  and — per the Grizz write principle — writes **only** the `grizz_contact_*`
+  attributes on an existing contact (`grizz_contact_email`, `grizz_contact_phone`,
+  title, seniority, persona, `grizz_contact_job_function`, linkedin, the collapsed
+  `grizz_contact_location`, `grizz_person_id`, and the parent company's
+  `gid_company` as `grizz_contact_company_gid`). The native name/email/phone and
+  the parent-company reference are seeded **only when creating a new person**, so
+  Grizz never overwrites a native field on a record it didn't create.
+  `--enrich-email`/`--enrich-phone` fetch fresh contact info first; `--dry-run`
+  resolves + counts without writing.
 
 ### Changed
 - **`setup --crm attio` is now config-driven.** It reads the slugs you actually map

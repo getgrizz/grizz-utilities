@@ -155,30 +155,31 @@ attio:
 # attributes below (setup reads THIS section, so it only creates what you map —
 # it never touches your Companies object).
 #
-# `*_field` are Attio's NATIVE People attributes (they already exist — setup never
-# creates them): the personal-name, the unique email dedup key, the phone list,
-# and the record-reference to Companies used to link each contact to its parent.
-# `field_mapping` are the grizz_* custom attributes; `gid` is the dedup id (matched
-# before email), and city/state/country collapse into one object-typed location
-# attribute exactly like companies do (map to native `primary_location` instead if
-# you prefer Attio's built-in).
+# Grizz writes ONLY to the grizz_* attributes below on an existing contact — it
+# never overwrites native fields on a record it didn't create. The `*_field`
+# natives (personal-name, the unique email dedup key, the phone list, the
+# Companies reference) are populated ONLY when CREATING a brand-new person, and
+# on every write email/phone/etc. also land on their grizz_contact_* attributes.
+# `gid` is the dedup id (matched before native email); city/state/country collapse
+# into one object-typed location attribute exactly like companies do.
 
 attio_contacts:
-  name_field:    name              # native personal-name
-  email_field:   email_addresses   # native unique attribute — the dedup key
-  phone_field:   phone_numbers     # native
-  company_ref:   company           # native record-reference to Companies (parent link)
+  name_field:    name              # native personal-name (seeded on create only)
+  email_field:   email_addresses   # native unique attribute — dedup key; seeded on create only
+  phone_field:   phone_numbers     # native (seeded on create only)
+  company_ref:   company           # native Companies reference — parent link, set on create only
   # last_sync_field: grizz_contact_last_sync   # optional; stamped only with GRIZZ_STAMP_LAST_SYNC=1
 
   field_mapping:
-    gid:          grizz_person_id           # dedup id — stamped on write, matched before email
-    company_gid:  grizz_contact_company_gid  # parent company's gid_company (the person is ALSO
-                                             # linked to the parent via the native `company` ref)
+    gid:          grizz_person_id            # dedup id — stamped on write, matched before email
+    company_gid:  grizz_contact_company_gid  # parent company's gid_company
     title:        grizz_contact_title
     seniority:    grizz_contact_seniority
-    department:   grizz_contact_function
+    department:   grizz_contact_job_function
     persona:      grizz_contact_persona
-    linkedin_url: grizz_contact_linkedin
+    email:        grizz_contact_email        # Grizz's email for the contact (always written)
+    phone:        grizz_contact_phone        # phone-number type (created with cleansing) — same as company grizz_phone
+    linkedin_url: grizz_contact_linkedin_url
     # location → ONE object-typed attribute (city/state/country collapse)
     city:         grizz_contact_location.locality
     state:        grizz_contact_location.region
