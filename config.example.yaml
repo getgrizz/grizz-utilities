@@ -171,7 +171,9 @@ attio_contacts:
   # last_sync_field: grizz_contact_last_sync   # optional; stamped only with GRIZZ_STAMP_LAST_SYNC=1
 
   field_mapping:
-    gid:          grizz_person_id       # dedup id — stamped on write, matched before email
+    gid:          grizz_person_id           # dedup id — stamped on write, matched before email
+    company_gid:  grizz_contact_company_gid  # parent company's gid_company (the person is ALSO
+                                             # linked to the parent via the native `company` ref)
     title:        grizz_contact_title
     seniority:    grizz_contact_seniority
     department:   grizz_contact_function

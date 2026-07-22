@@ -21,7 +21,9 @@ This project uses [Semantic Versioning](https://semver.org/).
   contact to an existing person by the Grizz person gid then native email
   (updates in place, never duplicates), links it to its parent Company record,
   and writes the native name/email/phone alongside the mapped `grizz_contact_*`
-  attributes. `--enrich-email`/`--enrich-phone` fetch fresh contact info first;
+  attributes — including the parent company's `gid_company` on the person record
+  (`company_gid → grizz_contact_company_gid`) in addition to the native `company`
+  reference link. `--enrich-email`/`--enrich-phone` fetch fresh contact info first;
   `--dry-run` resolves + counts without writing.
 
 ### Changed
