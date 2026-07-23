@@ -201,29 +201,30 @@ These Grizz fields are available for mapping in `config.yaml`:
 
 | Grizz Field | Description |
 |---|---|
+| `grizz_id` | Grizz internal company ID |
+| `gid_company` | Grizz canonical company ID (the stable driving key) |
+| `grizz_url` | Link to the company's profile on getgrizz.com |
 | `company_name` | Official company name |
-| `naics_code` | NAICS industry code (e.g. `236115`) |
-| `naics_description` | NAICS industry label (e.g. `New Single-Family Housing Construction`) |
+| `domain` | Company domain |
+| `linkedin_url` | LinkedIn company page URL |
 | `company_description` | AI-generated company description (≤1000 characters) |
-| `rationale` | Short AI explanation of the NAICS classification (≤200 characters) |
-| `valid_domain` | `true` if the domain is a real operating business |
-| `street_address` | Street address |
+| `phone` | Primary phone number |
+| `email` | Primary email address |
 | `city` | City |
 | `state_province_region` | State or province |
 | `country` | Country |
-| `zip_code` | ZIP / postal code |
-| `phone` | Primary phone number |
-| `email` | Primary email address |
-| `linkedin_url` | LinkedIn company page URL (enrichment source only) |
-| `erp_tech_stack` | ERP software detected in use (e.g. `"Viewpoint Vista"`). `null` for enrichment-source results. |
-| `erp_job_title` | Job title associated with the ERP signal |
-| `ats_tech_stack` | ATS/HR software detected in use. `null` for enrichment-source results. |
-| `ats_job_title` | Job title associated with the ATS signal |
+| `employee_range` | Employee count range, e.g. `"50-200"` |
+| `revenue_range` | Revenue range, e.g. `"$1M-$10M"` |
+| `naics_code` | NAICS industry code (e.g. `236115`) |
+| `grizz_activity` | Grizz construction activity classification |
+| `grizz_construction` | `true` if Grizz has confirmed this is a construction company |
+| `erp_tech_stack` | ERP software detected in use (e.g. `"Viewpoint Vista"`); `null` if none detected |
+| `erp_match_type` | How the ERP signal was identified |
+| `erp_keyword_usage` | Keyword evidence for the ERP signal |
+| `ats_tech_stack` | ATS/HR software detected in use; `null` if none detected |
+| `ats_match_type` | How the ATS signal was identified |
+| `ats_keyword_usage` | Keyword evidence for the ATS signal |
 | `other_tech_signals` | Comma-separated list of other detected software |
-| `grizz_id` | Grizz internal company ID (database source only) |
-| `grizz_url` | Link to the company's profile on getgrizz.com (database source only) |
-| `employee_range` | Employee count range, e.g. `"50-200"` (database source only) |
-| `grizz_construction` | `true` if Grizz has confirmed this is a construction company (database source only) |
 
 ---
 

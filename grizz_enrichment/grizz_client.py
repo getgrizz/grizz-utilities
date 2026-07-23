@@ -614,18 +614,10 @@ def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) ->
 
     results = fetch_results(api_key, request_id)
 
-    if results.get("source") == "no_match":
-        return None
-
-    # Results are wrapped: {"source": "...", "company": {...}}
-    company = results["company"]
-
-    # The "database" source uses different field names than "enrichment".
-    # Normalize to enrichment-source names so the mapper always sees consistent keys.
-    if results.get("source") == "database" and company:
-        company = _normalize_database_fields(company)
-
-    return company
+    # One canonical company shape for every result; `company` is null when the
+    # domain wasn't found. Key off its presence rather than a status label so the
+    # client doesn't depend on the exact wording of the result status.
+    return results.get("company") or None
 
 
 def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
@@ -685,12 +677,10 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
             continue
 
         results = fetch_results(api_key, request_id)
-        if results.get("source") == "no_match":
+        company = results.get("company")
+        if not company:
             no_match.append({"input": raw_input, "request_id": request_id})
             continue
-        company = results.get("company") or {}
-        if results.get("source") == "database" and company:
-            company = _normalize_database_fields(company)
         matched.append({"input": raw_input, "company": company,
                         "request_id": request_id})
 
@@ -708,20 +698,3 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
             "budget_resets_at":          body.get("budget_resets_at"),
         },
     }
-
-
-# Field name mapping: database source → enrichment source
-_DB_FIELD_MAP = {
-    "hq_city":    "city",
-    "hq_state":   "state_province_region",
-    "hq_country": "country",
-    "naics6":     "naics_code",
-}
-
-
-def _normalize_database_fields(company: dict) -> dict:
-    """Rename database-source field names to match enrichment-source names."""
-    normalized = {}
-    for key, value in company.items():
-        normalized[_DB_FIELD_MAP.get(key, key)] = value
-    return normalized
