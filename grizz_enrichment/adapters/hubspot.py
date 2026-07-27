@@ -193,17 +193,31 @@ class HubSpotAdapter(CRMAdapter):
         resp.raise_for_status()  # unreachable, satisfies type checkers
         return resp
 
-    def _search(self, filter_: dict, properties: list[str]) -> list[dict]:
-        """Execute a single-filter company search and return all results."""
+    def _search(self, filter_: dict, properties: list[str], max_retries: int = 4) -> list[dict]:
+        """Execute a single-filter company search and return all results.
+
+        Retries on 429 like `_post_with_retry` does.  A search that gives up is
+        raised, never swallowed: the caller uses these results to decide update
+        vs. create, so a silently empty result set means duplicates.
+        """
         body = {
             "filterGroups": [{"filters": [filter_]}],
             "properties": properties,
             "limit": 100,
         }
-        resp = self._session.post(
-            f"{_BASE_URL}/crm/v3/objects/companies/search",
-            json=body,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json().get("results", [])
+        for attempt in range(max_retries + 1):
+            resp = self._session.post(
+                f"{_BASE_URL}/crm/v3/objects/companies/search",
+                json=body,
+                timeout=15,
+            )
+            if resp.status_code == 429 and attempt < max_retries:
+                wait = int(resp.headers.get("Retry-After", "10"))
+                print(f"\n  Search rate limited — waiting {wait}s before retry "
+                      f"{attempt + 1}/{max_retries}...", end=" ", flush=True)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json().get("results", [])
+        resp.raise_for_status()  # retries exhausted on 429 — surface it
+        return []

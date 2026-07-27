@@ -9,6 +9,19 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **A failed bulk lookup no longer silently degrades into "create everything".**
+  `run.py audience` caught any `find_accounts_bulk` failure, set the match map to
+  `{}`, and carried on — so every company looked unmatched and a live push would
+  re-create records that already exist (concurrent pushes reported zero matches against a full
+  backlog -- the entire list queued for duplication). The run now
+  aborts with a message naming the likely cause (a concurrent push tripping the
+  rate limit) instead of proceeding on no match data.
+- **HubSpot company search retries 429s.** `HubSpotAdapter._search` had no retry,
+  unlike `_post_with_retry` — a single 429 failed the whole bulk lookup. It now
+  retries up to 4 times honoring `Retry-After`, and raises if the retries are
+  exhausted rather than returning an empty result set.
+
 ### Added
 - **"Run one push at a time" (README).** Documents that concurrent pushes against
   the same CRM portal are unsafe and must be run strictly sequentially. The match

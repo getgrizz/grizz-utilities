@@ -503,8 +503,17 @@ def run_audience(
     try:
         match_map = adapter.find_accounts_bulk(companies, field_mapping["grizz_id"])
     except Exception as e:
+        # Never fall through to an empty match map.  Every company would then look
+        # unmatched and the run would create duplicates of records that already
+        # exist — the failure mode is far worse than not running at all.
         console.print(f"  [red]Bulk lookup failed: {e}[/red]")
-        match_map = {}
+        console.print(
+            "  [red]Aborting — with no match data every company would be treated as\n"
+            "  new and re-created as a duplicate. If this was a rate limit (429),\n"
+            "  check that no other push is running against this CRM: pushes must be\n"
+            "  run one at a time. Wait for the limit to clear and re-run.[/red]"
+        )
+        raise typer.Exit(1)
 
     for company in companies:
         grizz_id = str(company.get("grizz_id") or company.get("company_id") or "")
