@@ -10,6 +10,18 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **"Run one push at a time" (README).** Documents that concurrent pushes against
+  the same CRM portal are unsafe and must be run strictly sequentially. The match
+  step pages HubSpot's Search API with a 250 ms sleep sized for HubSpot's 4 req/s
+  limit, which is **per portal, not per process** — so N concurrent runs issue
+  ~4 × N req/s and take `429 Too Many Requests`. A failed bulk lookup currently
+  degrades silently to an empty match map, so every company falls through to
+  "unmatched" and a live push would re-create records that already exist. Four
+  concurrent pushes reported `0 matched  the full list unmatched` on portals that already
+  held those companies — a dry run caught it before ~the whole list duplicates were
+  created. Also documents the dry-run-and-read-the-match-count check, and that
+  `--yes` skips the unmatched-creation prompt that is the last guardrail against
+  a degraded lookup.
 - **Robust Attio contact dedup — reuses the server cascade.** `people sync --crm
   attio` no longer matches on just gid+email. It now runs the SAME dedup logic as
   the HubSpot/Salesforce paths: a global strong-key match (grizz_person_id, email)

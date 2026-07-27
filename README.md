@@ -179,6 +179,59 @@ to full company data (free, no credits), then runs the normal match → update �
 create flow — so discovery/refinement stays in the MCP and the bulk write runs
 here, out of any model context.
 
+### Run one push at a time
+
+> **Never run two pushes against the same CRM portal concurrently.** Not two
+> `audience` runs, not `audience` alongside `people sync`, not one terminal tab
+> per batch. Split a large job into batches if you like — but run the batches
+> **strictly sequentially**.
+
+Every push starts by matching your list against records already in the CRM, and
+that match step is read-heavy: the HubSpot adapter pages the Search API in
+batches of 50 with a 250 ms sleep between calls, sized to sit just under
+HubSpot's Search API limit of 4 requests/second **per portal**. That limit is
+per portal, not per process — so N concurrent runs issue roughly 4 × N req/s and
+all of them start getting `429 Too Many Requests`.
+
+A failed bulk lookup currently degrades silently: the run prints
+`Bulk lookup failed: 429 Client Error: Too Many Requests`, treats the match map
+as empty, and every company falls through to "unmatched". The push then looks
+like a clean first-time load when it is in fact about to re-create records that
+already exist.
+
+This is not hypothetical. Four concurrent pushes produced:
+
+```
+Bulk lookup failed: 429 Client Error: Too Many Requests
+  0 matched  the full list unmatched
+```
+
+on portals where nearly all of those companies already existed. A dry run caught
+it; a real run would have created roughly the whole list duplicate companies.
+
+Sequentially, in one shell — each batch waits for the last to exit:
+
+```bash
+python run.py audience --crm hubspot --gids g1.csv && \
+python run.py audience --crm hubspot --gids g2.csv && \
+python run.py audience --crm hubspot --gids g3.csv
+```
+
+**Always dry-run first and read the match count.** `0 matched` — or any matched
+count far below what you expect for a portal that already holds these
+records — means the lookup degraded, not that the records are missing. Abort,
+wait for the rate limit to clear, and re-run that batch on its own before doing
+a live push.
+
+Note that `--yes` / `-y` (also auto-enabled when stdin is not a TTY, e.g. in CI
+or an agent hand-off) creates unmatched companies without prompting — that
+prompt is the last guardrail that would catch a degraded lookup. Only reach for
+`--yes` on a batch whose dry run already reported a sane match count.
+
+The same rule applies to Salesforce and Attio. The 429 above came from HubSpot's
+Search API, but every adapter shares one API quota per portal/workspace, and
+concurrent writes to the same object contend regardless of CRM.
+
 ### CSV format
 
 The `enrich` command requires a CSV with one column named `Id` or `Account ID` containing CRM record IDs:
