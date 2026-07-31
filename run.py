@@ -540,10 +540,18 @@ def run_audience(
     update, create, report) are identical regardless of source.
 
     When non-interactive (`assume_yes`, or no TTY — e.g. an agent/MCP hand-off or
-    CI), unmatched companies are created without prompting and failed batches are
-    retried once automatically, so the run never blocks on a missing terminal.
+    CI), failed batches are retried once automatically so the run never blocks on
+    a missing terminal.  Creating unmatched companies is deliberately NOT part of
+    that: it requires an explicit `--yes`, never a merely-absent TTY.  A company
+    lands in `unmatched` when the CRM lookup *failed to find* it, which is not the
+    same claim as "it isn't there" — an exact-string domain search misses
+    `www.foo.com` when Grizz holds `foo.com`.  Auto-creating on that would write
+    duplicates of live accounts, unprompted, in exactly the runs nobody is
+    watching, so the destructive branch fails closed.
     """
     non_interactive = assume_yes or not sys.stdin.isatty()
+    # Never inferred from the absence of a terminal — only an explicit flag.
+    create_unmatched = assume_yes
 
     # ── Config ──────────────────────────────────────────────────────────────
     config = load_config(config_path)
@@ -723,11 +731,18 @@ def run_audience(
     created = 0
     if unmatched:
         if non_interactive:
-            create = True
-            console.print(
-                f"{len(unmatched)} unmatched compan(ies) — creating new records "
-                f"(non-interactive)."
-            )
+            create = create_unmatched
+            if create:
+                console.print(
+                    f"{len(unmatched)} unmatched compan(ies) — creating new records "
+                    f"(--yes)."
+                )
+            else:
+                console.print(
+                    f"[yellow]{len(unmatched)} unmatched compan(ies) — not created "
+                    f"(no terminal to confirm at). Re-run with --yes if they really "
+                    f"are new; check for domain mismatches first.[/yellow]"
+                )
         else:
             create = questionary.confirm(
                 f"{len(unmatched)} companies could not be matched to an existing account "
@@ -1734,7 +1749,7 @@ def audience(
     gids: Optional[Path] = typer.Option(None, "--gids", help="File of gid_company values (one per line or a CSV with a gid_company column) — e.g. a filtered selection from the Grizz MCP"),
     config: Path = typer.Option(Path("config.yaml"), help="Path to your config.yaml"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing to CRM"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive: create unmatched companies and retry failures without prompting (auto-enabled when not a TTY)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Create unmatched companies without prompting. Required for creation in any non-TTY run — a missing terminal alone never creates."),
     batch_size: int = typer.Option(200, "--batch-size", help="Records per API call when creating accounts (max 200)"),
 ):
     """Push a Grizz company list (audience, prompt, or an explicit gid list) into your CRM."""
