@@ -3,6 +3,8 @@
 Handles the full submit → poll → fetch cycle.
 """
 
+import os
+import random
 import time
 
 import requests
@@ -10,6 +12,63 @@ import requests
 BASE_URL = "https://getgrizz.com"
 POLL_INTERVAL = 5   # seconds between status checks
 MAX_POLLS = 24      # give up after 2 minutes
+
+# ── HTTP resilience ─────────────────────────────────────────────────────────
+# The enrich submit → poll → fetch cycle runs under concurrency (e.g. `run.py
+# enrich --concurrency 12`) and can hit endpoint throttling. Without retries a
+# single Read-timeout or 429 fails the whole record — that's what timed out
+# 79/100 at concurrency 12 near the tail of a large enrichment day. Retry
+# transient failures with JITTERED exponential backoff (the jitter de-syncs the
+# concurrent workers so they stop stampeding a throttled endpoint) and honor
+# Retry-After. Tunable via env; timeout defaults higher than the old hardcoded 30.
+DEFAULT_TIMEOUT = int(os.environ.get("GRIZZ_HTTP_TIMEOUT", "60"))
+_MAX_RETRIES = int(os.environ.get("GRIZZ_HTTP_RETRIES", "4"))
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_BACKOFF_CAP = 20   # seconds
+
+
+def _retry_after_seconds(resp: "requests.Response", default: int) -> int:
+    """Seconds to wait from a 429 Retry-After header (integer count OR HTTP-date),
+    capped.  Falls back to `default` when the header is absent/unparseable."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, min(int(raw), _BACKOFF_CAP))
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        return max(1, min(int((dt - datetime.now(timezone.utc)).total_seconds()), _BACKOFF_CAP))
+    except Exception:
+        return default
+
+
+def _request(method: str, url: str, *, timeout: int | None = None, **kwargs) -> "requests.Response":
+    """requests.request with retry + jittered exponential backoff on TRANSIENT
+    failures (ReadTimeout / ConnectionError / 429 / 5xx).  Non-transient 4xx
+    responses are returned unretried for the caller to `_raise_with_body` — a bad
+    request is never retried.  Timeout defaults to GRIZZ_HTTP_TIMEOUT, retries to
+    GRIZZ_HTTP_RETRIES."""
+    timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, timeout=timeout, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            if attempt < _MAX_RETRIES:
+                time.sleep(min(2 ** attempt, _BACKOFF_CAP) + random.uniform(0, 1))
+                continue
+            raise
+        if resp.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
+            base = min(2 ** attempt, _BACKOFF_CAP) + random.uniform(0, 1)
+            time.sleep(_retry_after_seconds(resp, int(base)) if resp.status_code == 429 else base)
+            continue
+        return resp
+    raise last_exc  # pragma: no cover
 
 
 def _raise_with_body(resp: "requests.Response") -> None:
@@ -61,7 +120,7 @@ def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
     if not payload:
         raise ValueError("submit() requires at least one cascade-input field.")
     url = f"{BASE_URL}/api/v1/companies/enrich/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=30)
+    resp = _request("POST", url, json=payload, headers=_headers(api_key))
     _raise_with_body(resp)
     return resp.json()
 
@@ -559,7 +618,7 @@ def create_in_crm(
 def poll_status(api_key: str, request_id: str) -> dict:
     """Check the status of an in-flight enrichment request."""
     url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/"
-    resp = requests.get(url, headers=_headers(api_key), timeout=30)
+    resp = _request("GET", url, headers=_headers(api_key))
     _raise_with_body(resp)
     return resp.json()
 
@@ -567,7 +626,7 @@ def poll_status(api_key: str, request_id: str) -> dict:
 def fetch_results(api_key: str, request_id: str) -> dict:
     """Fetch enriched data for a completed request. Marks the result as retrieved."""
     url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/results/"
-    resp = requests.get(url, headers=_headers(api_key), timeout=30)
+    resp = _request("GET", url, headers=_headers(api_key))
     _raise_with_body(resp)
     return resp.json()
 
