@@ -112,22 +112,43 @@ class HubSpotAdapter(CRMAdapter):
                     matched[gid] = record["id"]
             time.sleep(0.25)  # respect 4 req/s Search API limit
 
-        # Match remaining unmatched companies by domain
+        # Match remaining unmatched companies by domain.
+        #
+        # Both sides go through `clean_domain`, the same normalizer `get_domain`
+        # and the Attio adapter already use — HubSpot's `domain` is a raw string
+        # with no server-side normalization (Attio has `root_domain`; we don't
+        # get that here), so a record stored as `www.foo.com` or
+        # `https://foo.com/` never equalled the `foo.com` Grizz holds.  Such a company comes back unmatched, which the caller reads as
+        # "not in the CRM" and offers to create -- i.e. a duplicate of a
+        # live account.
+        #
+        # The Search API only does exact IN matching, so cleaning the comparison
+        # isn't enough on its own: the `www.` record has to be asked for by name
+        # before there is anything to compare.  Send both spellings, reconcile
+        # through clean_domain on the way back, and key the result on the
+        # caller's original domain string — that is what `run_audience` looks up.
         matched_grizz_ids = set(matched.keys())
-        unmatched_domains = [
-            c["domain"] for c in companies
-            if c.get("domain") and str(c.get("grizz_id", "")) not in matched_grizz_ids
-        ]
-        for i in range(0, len(unmatched_domains), _SEARCH_BATCH):
-            batch = unmatched_domains[i:i + _SEARCH_BATCH]
+        by_clean: dict[str, str] = {}
+        for c in companies:
+            if not c.get("domain") or str(c.get("grizz_id", "")) in matched_grizz_ids:
+                continue
+            cleaned = _clean_domain(c["domain"])
+            if cleaned:
+                by_clean.setdefault(cleaned, c["domain"])
+
+        variants = [v for cleaned in by_clean for v in (cleaned, f"www.{cleaned}")]
+        for i in range(0, len(variants), _SEARCH_BATCH):
+            batch = variants[i:i + _SEARCH_BATCH]
             results = self._search(
                 {"propertyName": "domain", "operator": "IN", "values": batch},
                 properties=["domain"],
             )
             for record in results:
-                domain = (record.get("properties") or {}).get("domain")
-                if domain and domain in batch:
-                    matched[domain] = record["id"]
+                original = by_clean.get(
+                    _clean_domain((record.get("properties") or {}).get("domain")) or ""
+                )
+                if original:
+                    matched[original] = record["id"]
             time.sleep(0.25)
 
         return matched
