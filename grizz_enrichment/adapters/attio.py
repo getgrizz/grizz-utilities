@@ -36,22 +36,12 @@ _WRITE_CONCURRENCY = 12  # parallel writes — Attio caps writes at 25/s; 429 bu
 _READ_TIMEOUT = 30   # seconds, GET/query
 _WRITE_TIMEOUT = 60  # seconds, PUT/PATCH/POST (Attio writes can be slow under load)
 _MAX_RETRIES = 4     # transient-failure retries (timeout / connection / 429 / 5xx)
-_URL_PREFIXES = ("https://", "http://", "www.")
+from ..domain_utils import clean_domain as _clean_domain
 
 # Attio slugs that need special value shaping on write.
 _DOMAINS_SLUG = "domains"
 _PHONE_SLUGS = frozenset({"grizz_phone", "grizz_hq_phone",
                           "grizz_contact_hq_phone", "grizz_contact_phone"})
-
-
-def _clean_domain(raw: str) -> str | None:
-    """Strip protocol and www from a URL to get a bare domain."""
-    domain = raw.strip().lower()
-    for prefix in _URL_PREFIXES:
-        if domain.startswith(prefix):
-            domain = domain[len(prefix):]
-    domain = domain.rstrip("/").split("/")[0]
-    return domain or None
 
 
 def _to_e164(raw) -> str | None:

@@ -9,6 +9,8 @@ import time
 
 import requests
 
+from .domain_utils import clean_domain
+
 BASE_URL = "https://getgrizz.com"
 POLL_INTERVAL = 5   # seconds between status checks
 MAX_POLLS = 24      # give up after 2 minutes
@@ -96,6 +98,8 @@ def _headers(api_key: str) -> dict:
 # Canonical cascade-input keys (see the Grizz API docs §10).  submit() and
 # submit_bulk() only forward keys present in this set, so callers can pass
 # entire CRM-derived dicts without scrubbing extras.
+LOOKUP_BATCH_MAX = 5000   # server-side cap on one lookup-batch call
+
 _CASCADE_INPUT_KEYS = frozenset({
     "gid_company", "grizz_id", "domain",
     "company_name", "hq_city", "hq_state", "hq_country", "hq_phone",
@@ -103,8 +107,23 @@ _CASCADE_INPUT_KEYS = frozenset({
 
 
 def _cascade_payload(company: dict) -> dict:
-    """Pull only the cascade-input keys out of `company`, dropping empties."""
-    return {k: company[k] for k in _CASCADE_INPUT_KEYS if company.get(k)}
+    """Pull only the cascade-input keys out of `company`, dropping empties.
+
+    `domain` is normalized through `clean_domain` because NO server-side match
+    endpoint normalizes it (see the Grizz API docs §10) — a dirty `https://www.x.com/`
+    silently misses a company Grizz knows.  The adapters already cleaned domains
+    on the way out of a CRM, but CSV- and file-fed callers (`run.py lookup`,
+    `_resolve_gids`) never touched an adapter, so they sent raw values straight
+    through.  Doing it here covers every cascade path at once.
+    """
+    payload = {k: company[k] for k in _CASCADE_INPUT_KEYS if company.get(k)}
+    if "domain" in payload:
+        cleaned = clean_domain(payload["domain"])
+        if cleaned:
+            payload["domain"] = cleaned
+        else:
+            del payload["domain"]
+    return payload
 
 
 def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
@@ -181,8 +200,16 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
     structured view per input.  No EnrichmentRequest rows are created and
     no credits are charged.
 
-    Used internally by orchestrator endpoints (tech-gap, create-crm) and
-    available to MCP tools that need Grizz's view for a list of records.
+    Used internally by orchestrator endpoints (tech-gap, create-crm) and by
+    `run.py lookup` / `_resolve_gids`.
+
+    Inputs over the endpoint's 5000 cap are chunked automatically and the
+    results concatenated, so callers never chunk themselves.  Transient 429/5xx
+    are retried with jittered backoff via `_request`.
+
+    Domains are normalized by `_cascade_payload`, so the `input` echoed back
+    carries the CLEANED domain, not the caller's raw value.  Key results by
+    `clean_domain(...)` when mapping them onto your own rows.
 
     Returns a list of:
         {
@@ -193,11 +220,15 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
                          employee_range, ...} | null
         }
     """
-    payload = {"lookups": [_cascade_payload(l) for l in lookups]}
     url = f"{BASE_URL}/api/v1/companies/lookup-batch/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
-    _raise_with_body(resp)
-    return resp.json().get("matches", [])
+    matches: list[dict] = []
+    for i in range(0, len(lookups), LOOKUP_BATCH_MAX):
+        payload = {"lookups": [_cascade_payload(l)
+                               for l in lookups[i:i + LOOKUP_BATCH_MAX]]}
+        resp = _request("POST", url, json=payload, headers=_headers(api_key))
+        _raise_with_body(resp)
+        matches.extend(resp.json().get("matches", []))
+    return matches
 
 
 def setup_instructions(api_key: str, crm: str = "attio") -> dict:

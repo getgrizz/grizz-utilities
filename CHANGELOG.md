@@ -9,6 +9,47 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`run.py lookup` — read-only DB lookup over a company list.** The cheap first
+  pass over a large CRM backlog: it reports which companies Grizz already knows
+  without creating `EnrichmentRequest` rows or charging credits, so `enrich` is
+  only spent on the genuine misses. Reads `.jsonl`, a CSV with a
+  `domain`/`gid_company` column, or a plain one-per-line domain list; writes
+  per-record results (`--out`) and matched company payloads (`--companies`).
+  Deduplicates on the cascade key first, so a large backlog costs one call
+  per 5,000 *distinct* companies rather than per row.
+
+  This capability existed only as separate one-off scripts outside the package (byte-identical, calling the
+  REST endpoint directly) because the CLI offered no equivalent. `lookup_batch`
+  was reachable in the library but only as an internal step inside `audience`.
+
+### Fixed
+- **Dirty domains no longer silently miss.** `POST /api/v1/companies/lookup-batch/`
+  does not normalize its input, so a stored CRM domain of
+  `https://www.example.com/` came back `matched:false` for a company Grizz
+  knows. The adapters cleaned domains on the way out of a CRM, but
+  `grizz_client._cascade_payload` did not — so CSV- and file-fed callers
+  (`_resolve_gids`, and now `lookup`) sent raw values straight through.
+  Normalization now happens in `_cascade_payload`, covering every cascade path
+  at once. Measured on a large HubSpot backlog: 0.3–0.7% of `domain`
+  values are dirty; cleaning them recovers in-ICP matches that were previously invisible.
+
+  Note for callers: the `input` echoed back by the endpoint now carries the
+  **cleaned** domain, so results must be keyed on `clean_domain(...)`, not on
+  the caller's raw value. `_resolve_gids` was keying on the raw value and has
+  been corrected — it previously could not have matched a dirty domain anyway.
+
+### Changed
+- **One canonical `clean_domain`.** Extracted to `grizz_enrichment/domain_utils.py`
+  and imported by all three adapters, which each carried a byte-identical private
+  `_clean_domain` plus its own `_URL_PREFIXES`. Any separately kept
+  copy of `domain_utils.py` should now import from the package.
+- **`grizz_client.lookup_batch` chunks and retries internally.** Inputs over the
+  5,000 server cap are split and concatenated automatically, and transient
+  429/5xx go through `_request`'s jittered backoff instead of a bare
+  `requests.post`. Callers no longer chunk themselves (`_companies_from_gids`
+  and `_resolve_gids` simplified accordingly).
+
 ### Fixed
 - **A failed bulk lookup no longer silently degrades into "create everything".**
   `run.py audience` caught any `find_accounts_bulk` failure, set the match map to

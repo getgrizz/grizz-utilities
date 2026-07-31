@@ -30,6 +30,7 @@ from grizz_enrichment import __version__, grizz_client
 from grizz_enrichment.adapters import ADAPTERS, CONTACT_ADAPTERS
 from grizz_enrichment.adapters.attio import AttioAdapter, AttioContactAdapter
 from grizz_enrichment.audience_client import fetch_audience, submit as submit_audience
+from grizz_enrichment.domain_utils import clean_domain
 from grizz_enrichment.grizz_client import enrich as grizz_enrich
 from grizz_enrichment.mapper import apply_mapping
 from grizz_enrichment.setup_salesforce import run_setup as run_setup_salesforce
@@ -359,23 +360,163 @@ def _read_gids(path: Path) -> list[str]:
     return [r[col].strip() for r in rows[start:] if len(r) > col and r[col].strip()]
 
 
+_LOOKUP_ID_COLS = ("crm_record_id", "record_id", "id")
+
+
+def _read_lookup_rows(path: Path) -> list[dict]:
+    """Read lookup inputs from a JSONL, CSV, or plain one-per-line file.
+
+    Returns rows of {record_id, domain, gid_company} — record_id is optional and
+    only used to echo the caller's own key back into the results, so a CRM
+    backlog round-trips without a join on the far side.
+    """
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".jsonl":
+        rows = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            rows.append({
+                "record_id":   next((str(r[c]) for c in _LOOKUP_ID_COLS if r.get(c)), ""),
+                "domain":      (r.get("domain") or "").strip(),
+                "gid_company": (r.get("gid_company") or "").strip(),
+            })
+        return rows
+
+    raw = [r for r in csv.reader(text.splitlines()) if r and any(c.strip() for c in r)]
+    if not raw:
+        return []
+    header = [h.strip().lower() for h in raw[0]]
+    if "domain" in header or "gid_company" in header:
+        idx = {name: header.index(name) for name in
+               ("domain", "gid_company", *_LOOKUP_ID_COLS) if name in header}
+
+        def cell(r: list[str], name: str) -> str:
+            i = idx.get(name)
+            return (r[i].strip() if i is not None and len(r) > i else "")
+
+        return [{
+            "record_id":   next((cell(r, c) for c in _LOOKUP_ID_COLS if cell(r, c)), ""),
+            "domain":      cell(r, "domain"),
+            "gid_company": cell(r, "gid_company"),
+        } for r in raw[1:]]
+
+    # No recognized header — treat column 0 as a bare domain list, skipping a
+    # stray header cell that obviously isn't one.
+    start = 1 if raw[0][0].strip().lower() in ("domain", "domains", "website", "url") else 0
+    return [{"record_id": "", "domain": r[0].strip(), "gid_company": ""}
+            for r in raw[start:] if r[0].strip()]
+
+
+def run_lookup(input_path: Path, out: Path | None, companies_out: Path | None) -> None:
+    """DB-only cascade lookup over a company list — no scrape, no credits.
+
+    The read-only counterpart to `enrich`: it answers "which of these does Grizz
+    already know?" without creating EnrichmentRequest rows or charging anything,
+    so it is the correct first pass over a large CRM backlog.  Only the misses
+    are worth spending an `enrich` on afterwards.
+    """
+    api_key = os.environ.get("GRIZZ_API_KEY")
+    if not api_key:
+        console.print("[red]GRIZZ_API_KEY is not set.[/red] Add it to your [bold].env[/bold] file.")
+        raise typer.Exit(1)
+    if not input_path.exists():
+        console.print(f"[red]Input file not found: {input_path}[/red]")
+        raise typer.Exit(1)
+
+    rows = _read_lookup_rows(input_path)
+    if not rows:
+        console.print(f"[red]No lookup inputs found in {input_path}.[/red]")
+        raise typer.Exit(1)
+
+    # Deduplicate on the cascade key so a large backlog costs one call per
+    # 5000 DISTINCT companies, not per row.
+    lookups: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for r in rows:
+        key = (r["gid_company"], clean_domain(r["domain"]) or "")
+        if key == ("", "") or key in seen:
+            continue
+        seen.add(key)
+        lookups.append({k: v for k, v in
+                        (("gid_company", r["gid_company"]), ("domain", r["domain"])) if v})
+
+    console.print(f"Rows: {len(rows)}  |  distinct companies to look up: {len(lookups)}")
+    t0 = time.time()
+    try:
+        matches = grizz_client.lookup_batch(api_key, lookups)
+    except Exception as e:
+        console.print(f"[red]Lookup failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    by_key: dict[tuple[str, str], dict] = {}
+    for m in matches:
+        inp = (m or {}).get("input") or {}
+        # The echo carries explicit nulls for unused cascade keys, so `.get(k, "")`
+        # yields None (the key exists) and would never join back to a row key.
+        by_key[(inp.get("gid_company") or "", clean_domain(inp.get("domain")) or "")] = m
+
+    hits = 0
+    via: dict[str, int] = {}
+    companies: dict[str, dict] = {}
+    results: list[dict] = []
+    for r in rows:
+        d = clean_domain(r["domain"]) or ""
+        m = by_key.get((r["gid_company"], d)) or {}
+        c = m.get("company") or {}
+        if m.get("matched") and c:
+            hits += 1
+            via[m.get("match_via") or "?"] = via.get(m.get("match_via") or "?", 0) + 1
+            companies.setdefault(c.get("gid_company") or d, c)
+        results.append({
+            "record_id": r["record_id"], "domain": r["domain"], "clean_domain": d,
+            "matched": bool(m.get("matched")), "match_via": m.get("match_via"),
+            "gid_company": c.get("gid_company"), "grizz_id": c.get("grizz_id"),
+            "company_name": c.get("company_name"), "naics": c.get("naics"),
+            "grizz_activity": c.get("grizz_activity"),
+        })
+
+    misses = len(rows) - hits
+    table = Table(title="Grizz DB lookup", show_header=True, header_style="bold")
+    table.add_column("Result")
+    table.add_column("Rows", justify="right")
+    table.add_column("%", justify="right")
+    table.add_row("matched", str(hits), f"{100 * hits / len(rows):.1f}%")
+    table.add_row("no match", str(misses), f"{100 * misses / len(rows):.1f}%")
+    console.print(table)
+    console.print(f"Distinct companies matched: {len(companies)}  |  "
+                  f"match_via: {via or '—'}  |  {time.time() - t0:.0f}s")
+
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8") as fh:
+            for row in results:
+                fh.write(json.dumps(row) + "\n")
+        console.print(f"  per-record results -> [bold]{out}[/bold]")
+    if companies_out:
+        companies_out.parent.mkdir(parents=True, exist_ok=True)
+        companies_out.write_text(json.dumps(companies, indent=2), encoding="utf-8")
+        console.print(f"  matched company payloads -> [bold]{companies_out}[/bold]")
+    if not out and not companies_out:
+        console.print("[dim]Tip: pass --out / --companies to persist the results.[/dim]")
+
+
 def _companies_from_gids(api_key: str, gids: list[str]) -> list[dict]:
     """Resolve gid_company values to Grizz company dicts via the read-only,
     no-credit lookup-batch endpoint, normalized to the audience-result shape
     that the downstream sync expects (hq_phone/hq_email -> phone/email)."""
     companies: list[dict] = []
     unmatched = 0
-    for i in range(0, len(gids), 5000):                      # lookup-batch caps at 5000
-        batch = gids[i:i + 5000]
-        for m in grizz_client.lookup_batch(api_key, [{"gid_company": g} for g in batch]):
-            company = m.get("company")
-            if not m.get("matched") or not company:
-                unmatched += 1
-                continue
-            c = dict(company)
-            c["phone"] = c.pop("hq_phone", "") or ""
-            c["email"] = c.pop("hq_email", "") or ""
-            companies.append(c)
+    for m in grizz_client.lookup_batch(api_key, [{"gid_company": g} for g in gids]):
+        company = m.get("company")
+        if not m.get("matched") or not company:
+            unmatched += 1
+            continue
+        c = dict(company)
+        c["phone"] = c.pop("hq_phone", "") or ""
+        c["email"] = c.pop("hq_email", "") or ""
+        companies.append(c)
     if unmatched:
         console.print(f"  [yellow]{unmatched} compan(ies) returned no data — skipped.[/yellow]")
     return companies
@@ -759,25 +900,27 @@ def _resolve_gids(api_key: str, rows: list[dict]) -> tuple[int, list[dict]]:
     if not need:
         return 0, []
     resolved = 0
-    for i in range(0, len(need), 5000):
-        chunk = need[i:i + 5000]
-        matches = grizz_client.lookup_batch(
-            api_key, [{"domain": r["domain"]} for r in chunk])
-        by_domain = {}
-        for m in matches:
-            d = ((m or {}).get("input") or {}).get("domain")
-            if d:
-                by_domain[d.lower()] = m
-        for r in chunk:
-            comp = (by_domain.get(r["domain"].lower()) or {}).get("company") or {}
-            gid = comp.get("gid_company")
-            if gid:
-                r["gid_company"] = gid
-                if not r["name"]:
-                    r["name"] = comp.get("company_name") or ""
-                if not r["domain_source"]:
-                    r["domain_source"] = "grizz"
-                resolved += 1
+    # Key both sides on the CLEANED domain: the client normalizes before sending,
+    # so the echoed `input.domain` is clean while `r["domain"]` is the raw CSV
+    # value.  Keying on the raw value would miss precisely the dirty domains
+    # (URLs, `www.`, trailing paths) that normalization exists to rescue.
+    matches = grizz_client.lookup_batch(
+        api_key, [{"domain": r["domain"]} for r in need])
+    by_domain = {}
+    for m in matches:
+        d = clean_domain(((m or {}).get("input") or {}).get("domain"))
+        if d:
+            by_domain[d] = m
+    for r in need:
+        comp = (by_domain.get(clean_domain(r["domain"]) or "") or {}).get("company") or {}
+        gid = comp.get("gid_company")
+        if gid:
+            r["gid_company"] = gid
+            if not r["name"]:
+                r["name"] = comp.get("company_name") or ""
+            if not r["domain_source"]:
+                r["domain_source"] = "grizz"
+            resolved += 1
     return resolved, [r for r in need if not r["gid_company"]]
 
 
@@ -1619,6 +1762,22 @@ def audience(
     batch_size = max(1, min(batch_size, 200))
     run_audience(crm, config, dry_run, audience_id=audience_id, prompt=prompt,
                  batch_size=batch_size, gids=gid_list, assume_yes=yes)
+
+
+@app.command()
+def lookup(
+    input_path: Path = typer.Option(..., "--input", "-i", help="Companies to look up: a .jsonl ({domain, crm_record_id}), a CSV with a domain/gid_company column, or a plain one-per-line domain list"),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write per-record results as JSONL (matched, match_via, gid_company, ...)"),
+    companies_out: Optional[Path] = typer.Option(None, "--companies", help="Write matched company payloads as JSON, keyed by gid_company"),
+):
+    """Look up companies in Grizz's database — read-only, no scrape, no credits.
+
+    The cheap first pass over a large backlog: it reports which companies Grizz
+    already knows, so you only spend `enrich` on the ones it doesn't.  Domains
+    are normalized before matching (the API does not do this for you), which is
+    worth ~0.3-0.7% of a typical CRM export.
+    """
+    run_lookup(input_path, out, companies_out)
 
 
 def _run_setup(crm: str, contacts: bool, dry_run: bool, config_path: Path) -> None:

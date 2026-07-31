@@ -7,17 +7,7 @@ from simple_salesforce import Salesforce
 from .base import CRMAdapter
 
 # URL prefixes to strip when extracting a clean domain from a Website field
-_URL_PREFIXES = ("https://", "http://", "www.")
-
-
-def _clean_domain(raw: str) -> str | None:
-    """Strip protocol and www from a URL to get a bare domain."""
-    domain = raw.strip().lower()
-    for prefix in _URL_PREFIXES:
-        if domain.startswith(prefix):
-            domain = domain[len(prefix):]
-    domain = domain.rstrip("/").split("/")[0]  # drop any path component
-    return domain or None
+from ..domain_utils import clean_domain as _clean_domain
 
 
 class SalesforceAdapter(CRMAdapter):
