@@ -118,9 +118,9 @@ class HubSpotAdapter(CRMAdapter):
         # and the Attio adapter already use — HubSpot's `domain` is a raw string
         # with no server-side normalization (Attio has `root_domain`; we don't
         # get that here), so a record stored as `www.foo.com` or
-        # `https://foo.com/` never equalled the `foo.com` Grizz holds.  Such a company comes back unmatched, which the caller reads as
-        # "not in the CRM" and offers to create -- i.e. a duplicate of a
-        # live account.
+        # `https://foo.com/` never equalled the `foo.com` Grizz holds.  Such a
+        # company comes back unmatched, which the caller reads as "not in the
+        # CRM" and offers to create — i.e. a duplicate of a live account.
         #
         # The Search API only does exact IN matching, so cleaning the comparison
         # isn't enough on its own: the `www.` record has to be asked for by name

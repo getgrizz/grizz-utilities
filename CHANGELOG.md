@@ -19,8 +19,9 @@ This project uses [Semantic Versioning](https://semver.org/).
   Deduplicates on the cascade key first, so a large backlog costs one call
   per 5,000 *distinct* companies rather than per row.
 
-  This capability existed only as separate one-off scripts outside the package (byte-identical, calling the
-  REST endpoint directly) because the CLI offered no equivalent. `lookup_batch`
+  This capability existed only as separate one-off scripts outside
+  the package (byte-identical, calling the REST endpoint directly) because
+  the CLI offered no equivalent. `lookup_batch`
   was reachable in the library but only as an internal step inside `audience`.
 
 ### Fixed

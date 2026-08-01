@@ -9,8 +9,9 @@ repos too.  The copies drifted in reach, not in logic: the adapters applied it,
 
 Why it matters: `POST /api/v1/companies/lookup-batch/` does NOT normalize its
 input.  A stored CRM domain of `https://www.example.com/` comes back
-`matched:false` for a company Grizz knows perfectly well.  Measured on a large HubSpot backlog, 0.3-0.7% of `domain` values are dirty this way;
-cleaning them recovers in-ICP matches that were previously invisible.
+`matched:false` for a company Grizz knows perfectly well.  Measured on a large
+HubSpot backlog, 0.3-0.7% of `domain` values are dirty this way; cleaning them
+recovers in-ICP matches that were previously invisible.
 """
 
 _URL_PREFIXES = ("https://", "http://", "www.")
