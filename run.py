@@ -1079,11 +1079,22 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
                       f"(parent/dedup) — dropped as unattributable.[/yellow]")
     if failed_batches:
         console.print(f"[yellow]{failed_batches} batch(es) failed/timed out — re-run with --resume.[/yellow]")
+        console.print("[yellow]Those companies were NOT searched. checked.json lists every input "
+                      "company, so treat it as the roster — not as proof of coverage.[/yellow]")
     console.print(f"\nWrote:\n  {contacts_path}  (per-contact, keyed to each CRM record)"
                   f"\n  {checked_path}   (coverage roster — every company checked, found or not)"
                   f"\n  {csv_path}  (human review)")
     console.print("\ncontacts.json + checked.json are the discovery hand-off; feed them to "
                   "your contact-log loader before the paid email/phone enrich step.")
+
+    # Exit non-zero when any batch didn't finish. Previously this printed a
+    # warning and exited 0, so an automated caller saw success: "Done.", a full
+    # checked.json roster, and no contacts — indistinguishable from "these
+    # companies genuinely have no contacts". Fifteen consecutive chunks were
+    # recorded as processed that way. Partial output is still written and
+    # --resume still works; only the exit status changes.
+    if failed_batches:
+        raise typer.Exit(1)
 
 
 @people_app.command("discover")
