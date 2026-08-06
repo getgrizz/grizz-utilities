@@ -328,6 +328,39 @@ def _first_naics(value: str | None) -> str | None:
     return value.split(",")[0].strip()[:6] or None
 
 
+def _grizz_data(company: dict) -> dict:
+    """Normalize a Grizz company payload to the flat grizz_* shape `apply_mapping`
+    expects.  Accepts either payload dialect: the audience-result shape
+    (phone/email) and the raw lookup-batch shape (hq_phone/hq_email), so an
+    audience push and a lookup push write the same fields from the same code."""
+    grizz_id = company.get("grizz_id") or company.get("company_id")
+    return {
+        "grizz_id":     grizz_id,
+        "gid_company":  company.get("gid_company"),
+        "grizz_url":    company.get("grizz_url") or (f"https://getgrizz.com/company/{grizz_id}" if grizz_id else None),
+        "company_name": company.get("company_name"),
+        "domain":       company.get("domain"),
+        "linkedin_url": company.get("linkedin_url"),
+        "company_description": company.get("company_description"),
+        "phone":        company.get("phone") or company.get("hq_phone"),
+        "email":        company.get("email") or company.get("hq_email"),
+        "city":         company.get("hq_city"),
+        "state_province_region": company.get("hq_region"),
+        "country":      company.get("hq_country"),
+        "employee_range": company.get("employee_range"),
+        "naics_code":   _first_naics(company.get("naics")),
+        "grizz_activity": company.get("grizz_activity"),
+        "revenue_range": company.get("revenue_range"),
+        "erp_tech_stack":    company.get("erp_tech_stack"),
+        "erp_match_type":    company.get("erp_match_type"),
+        "erp_keyword_usage": company.get("erp_keyword_usage"),
+        "ats_tech_stack":    company.get("ats_tech_stack"),
+        "ats_match_type":    company.get("ats_match_type"),
+        "ats_keyword_usage": company.get("ats_keyword_usage"),
+        "other_tech_signals": company.get("other_tech_signals"),
+    }
+
+
 def _save_audience_csv(audience_id: str, companies: list[dict]) -> Path:
     """Write audience results to csv_out/Audience <id>.csv. Returns the path."""
     out_dir = Path("csv_out")
@@ -341,10 +374,39 @@ def _save_audience_csv(audience_id: str, companies: list[dict]) -> Path:
 
 
 def _read_gids(path: Path) -> list[str]:
-    """Read gid_company values from a file: a CSV with a gid_company/gid column,
-    or a plain one-per-line list.  Grizz company gids start with 'GC'."""
-    import csv
-    rows = [r for r in csv.reader(path.read_text().splitlines()) if r and r[0].strip()]
+    """Read gid_company values from a file: the JSONL that `lookup --out` writes,
+    a CSV with a gid_company/gid column, or a plain one-per-line list.  Grizz
+    company gids start with 'GC'.
+
+    Raises ValueError rather than guessing.  Feeding this a file it cannot parse
+    used to yield plausible-looking junk (csv.reader splits a JSON line on the
+    commas inside the object), which then resolved to zero companies with a exit
+    code 0 — a push that silently did nothing.  Every rejection here is loud.
+    """
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not lines:
+        return []
+
+    if lines[0].lstrip().startswith("{"):
+        # JSONL — what `lookup --out` emits.  Misses (no gid_company) are dropped
+        # by design: there is nothing to resolve.  Unparseable lines are not.
+        gids = []
+        for n, line in enumerate(lines, 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{path} line {n} is not valid JSON ({e}). A JSONL gid file "
+                    f"needs one JSON object per line, as `lookup --out` writes."
+                ) from e
+            if not isinstance(row, dict):
+                raise ValueError(f"{path} line {n} is not a JSON object.")
+            gid = str(row.get("gid_company") or row.get("gid") or "").strip()
+            if gid:
+                gids.append(gid)
+        return _validated_gids(gids, path)
+
+    rows = [r for r in csv.reader(lines) if r and r[0].strip()]
     if not rows:
         return []
     header = [h.strip().lower() for h in rows[0]]
@@ -357,7 +419,27 @@ def _read_gids(path: Path) -> list[str]:
         # No recognized header — skip a stray header row if the first cell isn't a gid.
         if not rows[0][col].strip().upper().startswith("GC"):
             start = 1
-    return [r[col].strip() for r in rows[start:] if len(r) > col and r[col].strip()]
+    return _validated_gids(
+        [r[col].strip() for r in rows[start:] if len(r) > col and r[col].strip()], path)
+
+
+def _validated_gids(gids: list[str], path: Path) -> list[str]:
+    """Drop values that are not Grizz company gids, loudly.  Downstream these
+    would come back as `returned no data — skipped`, which reads like a Grizz
+    coverage gap rather than a malformed input file."""
+    good = [g for g in gids if g.upper().startswith("GC")]
+    bad = [g for g in gids if not g.upper().startswith("GC")]
+    if bad and not good:
+        raise ValueError(
+            f"No Grizz company gids in {path} — every value read looks malformed "
+            f"(e.g. {bad[0]!r}). Grizz company gids start with 'GC'."
+        )
+    if bad:
+        console.print(
+            f"  [yellow]{len(bad)} value(s) in {path} are not Grizz company gids "
+            f"and were skipped (e.g. {bad[0]!r}).[/yellow]"
+        )
+    return good
 
 
 _LOOKUP_ID_COLS = ("crm_record_id", "record_id", "id")
@@ -520,6 +602,205 @@ def _companies_from_gids(api_key: str, gids: list[str]) -> list[dict]:
     if unmatched:
         console.print(f"  [yellow]{unmatched} compan(ies) returned no data — skipped.[/yellow]")
     return companies
+
+
+def _read_lookup_results(path: Path) -> list[dict]:
+    """Read the per-record JSONL that `lookup --out` writes.  Loud on anything else."""
+    rows = []
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"{path} line {n} is not valid JSON ({e}). `write --results` takes "
+                f"the JSONL that `lookup --out` writes, one JSON object per line."
+            ) from e
+        if not isinstance(row, dict):
+            raise ValueError(f"{path} line {n} is not a JSON object.")
+        rows.append(row)
+    return rows
+
+
+def run_write(
+    crm: str,
+    config_path: Path,
+    results_path: Path,
+    companies_path: Path | None,
+    dry_run: bool,
+    batch_size: int,
+) -> None:
+    """Write lookup hits back to the CRM records they came from — keyed by id.
+
+    The sink for `lookup`: it consumes `--out` (and optionally `--companies`) and
+    updates each record by the `crm_record_id` the caller supplied, so the write
+    lands on exactly the record that was looked up.  That is the difference from
+    `audience --gids`, which re-matches by domain string search and can therefore
+    miss a live account (`www.foo.com` vs `foo.com`) and create a duplicate.
+
+    Update-only by design.  A row in a lookup result is a record that already
+    exists in the CRM — there is nothing here to create, so nothing here can
+    duplicate.  Only grizz_* fields are written; native fields are never touched.
+    """
+    config = load_config(config_path)
+    crm_config = config.get(crm)
+    if not crm_config:
+        console.print(f"[red]No '{crm}' section found in {config_path}.[/red]")
+        raise typer.Exit(1)
+    field_mapping: dict = crm_config["field_mapping"]
+
+    api_key = os.environ.get("GRIZZ_API_KEY")
+    if not api_key:
+        console.print("[red]GRIZZ_API_KEY is not set.[/red] Add it to your [bold].env[/bold] file.")
+        raise typer.Exit(1)
+    if not results_path.exists():
+        console.print(f"[red]Results file not found: {results_path}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        results = _read_lookup_results(results_path)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    if not results:
+        console.print(f"[red]No rows found in {results_path}.[/red]")
+        raise typer.Exit(1)
+
+    hits = [r for r in results if r.get("matched")]
+    no_id = [r for r in hits if not str(r.get("record_id") or "").strip()]
+    writable, seen_ids = [], set()
+    dupes = 0
+    for r in hits:
+        rid = str(r.get("record_id") or "").strip()
+        if not rid:
+            continue
+        if rid in seen_ids:
+            dupes += 1
+            continue
+        seen_ids.add(rid)
+        writable.append(r)
+
+    console.print(f"Read [bold]{len(results)}[/bold] lookup result(s): "
+                  f"[green]{len(hits)} matched[/green], "
+                  f"{len(results) - len(hits)} no match.")
+    if no_id:
+        console.print(
+            f"  [yellow]{len(no_id)} matched row(s) carry no record_id and cannot be "
+            f"written by id — re-run `lookup` with a crm_record_id on each input "
+            f"row, or push those gids with `audience --gids`.[/yellow]"
+        )
+    if dupes:
+        console.print(f"  [dim]{dupes} duplicate record_id row(s) collapsed.[/dim]")
+    if not writable:
+        console.print("[red]Nothing to write.[/red]")
+        raise typer.Exit(1)
+
+    # ── Company payloads ────────────────────────────────────────────────────
+    # `lookup --companies` keys on gid_company; without that file the payloads are
+    # re-fetched from the same read-only endpoint `lookup` used — free, no credits.
+    payloads: dict[str, dict] = {}
+
+    def index(company: dict) -> None:
+        for key in (company.get("gid_company"), clean_domain(company.get("domain"))):
+            if key:
+                payloads.setdefault(key, company)
+
+    if companies_path:
+        if not companies_path.exists():
+            console.print(f"[red]Companies file not found: {companies_path}[/red]")
+            raise typer.Exit(1)
+        try:
+            loaded = json.loads(companies_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            console.print(f"[red]{companies_path} is not valid JSON ({e}).[/red]")
+            raise typer.Exit(1)
+        if not isinstance(loaded, dict):
+            console.print(f"[red]{companies_path} must be the JSON object "
+                          f"`lookup --companies` writes (keyed by gid_company).[/red]")
+            raise typer.Exit(1)
+        for key, company in loaded.items():
+            if isinstance(company, dict):
+                payloads.setdefault(key, company)
+                index(company)
+    else:
+        gids = sorted({str(r.get("gid_company")).strip() for r in writable
+                       if r.get("gid_company")})
+        console.print(f"No --companies file: resolving {len(gids)} company payload(s) "
+                      f"from Grizz (read-only, no credits)...", end=" ")
+        try:
+            for company in _companies_from_gids(api_key, gids):
+                index(company)
+        except Exception as e:
+            console.print(f"\n[red]Could not resolve company payloads: {e}[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]{len(payloads)} key(s).[/green]")
+
+    # ── Build the id-keyed update records ───────────────────────────────────
+    records, unresolved = [], []
+    for r in writable:
+        company = (payloads.get(str(r.get("gid_company") or "").strip())
+                   or payloads.get(r.get("clean_domain") or clean_domain(r.get("domain")) or ""))
+        if not company:
+            unresolved.append(r)
+            continue
+        mapped = apply_mapping(_grizz_data(company), field_mapping)
+        if not mapped:
+            unresolved.append(r)
+            continue
+        records.append({"Id": str(r["record_id"]).strip(), **mapped})
+
+    if unresolved:
+        console.print(
+            f"  [yellow]{len(unresolved)} matched row(s) had no company payload to "
+            f"write (e.g. {unresolved[0].get('domain') or unresolved[0].get('record_id')}) "
+            f"— skipped.[/yellow]"
+        )
+    if not records:
+        console.print("[red]Nothing to write after mapping — check the field_mapping "
+                      f"in {config_path}.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"\nWriting [bold]{len(records)}[/bold] record(s) to {crm.title()} "
+                  f"by record id.")
+    if dry_run:
+        console.print("[yellow]Dry run mode — CRM will not be updated.[/yellow]")
+        for r in records[:10]:
+            console.print(f"  [dim]{r['Id']}: would update "
+                          f"{[k for k in r if k != 'Id']}[/dim]")
+        if len(records) > 10:
+            console.print(f"  [dim]... and {len(records) - 10} more.[/dim]")
+        return
+
+    adapter = ADAPTERS[crm]()
+    console.print(f"Connecting to {crm.title()}...", end=" ")
+    try:
+        adapter.connect()
+    except KeyError as e:
+        console.print(f"\n[red]Missing environment variable: {e}[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Connection failed: {e}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]connected.[/green]")
+    if crm == "attio":
+        adapter.set_phone_slugs(_attio_phone_slugs(crm_config))
+
+    updated, failed = _run_update_batches(
+        adapter, records, batch_size, console, interactive=sys.stdin.isatty(),
+    )
+
+    table = Table(title="Lookup write", show_header=True, header_style="bold")
+    table.add_column("Result")
+    table.add_column("Records", justify="right")
+    table.add_row("updated", str(updated))
+    table.add_row("failed", str(len(failed)))
+    table.add_row("skipped (no record_id)", str(len(no_id)))
+    table.add_row("skipped (no payload)", str(len(unresolved)))
+    console.print()
+    console.print(table)
+    if failed:
+        raise typer.Exit(1)
 
 
 def run_audience(
@@ -687,32 +968,7 @@ def run_audience(
         # Build all update records first
         records_to_update = []
         for company, account_id in matched:
-            grizz_id = company.get("grizz_id") or company.get("company_id")
-            grizz_data = {
-                "grizz_id":    grizz_id,
-                "gid_company": company.get("gid_company"),
-                "grizz_url":   company.get("grizz_url") or (f"https://getgrizz.com/company/{grizz_id}" if grizz_id else None),
-                "company_name": company.get("company_name"),
-                "domain":       company.get("domain"),
-                "linkedin_url": company.get("linkedin_url"),
-                "phone":        company.get("phone"),
-                "email":        company.get("email"),
-                "city":         company.get("hq_city"),
-                "state_province_region": company.get("hq_region"),
-                "country":      company.get("hq_country"),
-                "employee_range": company.get("employee_range"),
-                "naics_code":   _first_naics(company.get("naics")),
-                "grizz_activity": company.get("grizz_activity"),
-                "revenue_range": company.get("revenue_range"),
-                "erp_tech_stack":    company.get("erp_tech_stack"),
-                "erp_match_type":    company.get("erp_match_type"),
-                "erp_keyword_usage": company.get("erp_keyword_usage"),
-                "ats_tech_stack":    company.get("ats_tech_stack"),
-                "ats_match_type":    company.get("ats_match_type"),
-                "ats_keyword_usage": company.get("ats_keyword_usage"),
-                "other_tech_signals": company.get("other_tech_signals"),
-            }
-            mapped = apply_mapping(grizz_data, field_mapping)
+            mapped = apply_mapping(_grizz_data(company), field_mapping)
             if not mapped:
                 continue
             records_to_update.append({"Id": account_id, **mapped})
@@ -756,32 +1012,7 @@ def run_audience(
             # Build all records first
             records_to_create = []
             for company in unmatched:
-                grizz_id = company.get("grizz_id") or company.get("company_id")
-                grizz_data = {
-                    "grizz_id":    grizz_id,
-                    "gid_company": company.get("gid_company"),
-                    "grizz_url":   f"https://getgrizz.com/company/{grizz_id}" if grizz_id else None,
-                    "company_name": company.get("company_name"),
-                    "domain":       company.get("domain"),
-                    "linkedin_url": company.get("linkedin_url"),
-                    "phone":        company.get("phone"),
-                    "email":        company.get("email"),
-                    "city":         company.get("hq_city"),
-                    "state_province_region": company.get("hq_region"),
-                    "country":      company.get("hq_country"),
-                    "employee_range": company.get("employee_range"),
-                    "naics_code":   _first_naics(company.get("naics")),
-                    "grizz_activity": company.get("grizz_activity"),
-                    "revenue_range": company.get("revenue_range"),
-                    "erp_tech_stack":    company.get("erp_tech_stack"),
-                    "erp_match_type":     company.get("erp_match_type"),
-                    "erp_keyword_usage": company.get("erp_keyword_usage"),
-                    "ats_tech_stack":    company.get("ats_tech_stack"),
-                    "ats_match_type":     company.get("ats_match_type"),
-                    "ats_keyword_usage": company.get("ats_keyword_usage"),
-                    "other_tech_signals": company.get("other_tech_signals"),
-                }
-                mapped = apply_mapping(grizz_data, field_mapping)
+                mapped = apply_mapping(_grizz_data(company), field_mapping)
                 if crm == "salesforce":
                     if company.get("company_name"):
                         mapped.setdefault("Name", company["company_name"])
@@ -1780,7 +2011,11 @@ def audience(
         if not gids.exists():
             console.print(f"[red]gids file not found: {gids}[/red]")
             raise typer.Exit(1)
-        gid_list = _read_gids(gids)
+        try:
+            gid_list = _read_gids(gids)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
         if not gid_list:
             console.print(f"[red]No gid_company values found in {gids}.[/red]")
             raise typer.Exit(1)
@@ -1804,6 +2039,28 @@ def lookup(
     worth ~0.3-0.7% of a typical CRM export.
     """
     run_lookup(input_path, out, companies_out)
+
+
+@app.command()
+def write(
+    crm: str = typer.Option("salesforce", help="CRM to write to"),
+    results: Path = typer.Option(..., "--results", "-r", help="The per-record JSONL that `lookup --out` wrote"),
+    companies: Optional[Path] = typer.Option(None, "--companies", help="The company payloads that `lookup --companies` wrote. Omit to re-fetch them from Grizz (read-only, no credits)."),
+    config: Path = typer.Option(Path("config.yaml"), "--config", help="Path to your config.yaml"),
+    batch_size: int = typer.Option(200, "--batch-size", help="Records per CRM batch write (max 200)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing to the CRM"),
+):
+    """Write lookup hits back to the CRM records they came from — keyed by record id.
+
+    The sink for `lookup`: run `lookup --input backlog.jsonl --out hits.jsonl`,
+    then `write --results hits.jsonl` to push what Grizz already knew onto those
+    exact records.  Update-only — every row is a record that already exists, so
+    this path cannot create a duplicate, and it spends no credits.
+
+    Each input row needs a `crm_record_id` for its record id to round-trip; rows
+    without one are reported and skipped rather than guessed at.
+    """
+    run_write(crm, config, results, companies, dry_run, max(1, min(batch_size, 200)))
 
 
 def _run_setup(crm: str, contacts: bool, dry_run: bool, config_path: Path) -> None:

@@ -21,8 +21,27 @@ This project uses [Semantic Versioning](https://semver.org/).
 
   The underlying `lookup_batch` was already reachable in the library, but only
   as an internal step inside `audience` — there was no command that exposed it.
+- **`run.py write` — the sink for `lookup`.** Writes lookup hits back to the CRM
+  records they came from, keyed by the `crm_record_id` each input row carried.
+  `lookup` had no consumer: it printed a table and dropped two files that no
+  command in the package could read, so the free matches it found could only be
+  pushed by re-matching them fuzzily (`audience --gids`) or re-scraping them at a
+  credit each (`enrich`). `write` is update-only — every row is a record that
+  already exists, so it cannot create a duplicate — writes only `grizz_*` fields,
+  and spends no credits. `--companies` is optional; without it the payloads are
+  re-fetched from the same read-only endpoint `lookup` used. Matched rows with no
+  `crm_record_id`, and rows with no company payload, are reported and skipped.
 
 ### Fixed
+- **`audience --gids` no longer silently discards a lookup JSONL.** `_read_gids`
+  parsed every input with `csv.reader`, so a `lookup --out` file was split on the
+  commas *inside* each JSON object: cell 0 came back as `{"record_id": ""`, the
+  `gid_company` header probe missed, and the no-header branch then dropped the
+  first row as a stray header. Three real matches in, zero companies out, one row
+  discarded, exit code 0 — a push that reported nothing wrong and did nothing. It
+  now reads JSONL as JSON, and raises on a line it cannot parse or a file with no
+  Grizz gids in it instead of guessing. Values that aren't gids are reported, not
+  passed downstream to reappear as `returned no data — skipped`.
 - **Dirty domains no longer silently miss.** `POST /api/v1/companies/lookup-batch/`
   does not normalize its input, so a stored CRM domain of
   `https://www.example.com/` came back `matched:false` for a company Grizz

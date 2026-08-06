@@ -164,7 +164,7 @@ Provide exactly one source: `--audience-id`, `--prompt`, or `--gids`.
 |---|---|
 | `--audience-id` | ID of an existing Grizz audience (loads the whole audience) |
 | `--prompt` | Natural language prompt to create a new audience |
-| `--gids` | File of `gid_company` values — one per line, or a CSV with a `gid_company` column — to load exactly that set |
+| `--gids` | File of `gid_company` values — one per line, a CSV with a `gid_company` column, or the JSONL `lookup --out` writes — to load exactly that set |
 | `--crm` | CRM to use: `salesforce`, `hubspot`, or `attio` |
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--batch-size` | Records per API call when creating accounts (default: `200`, max: `200`) |
@@ -178,6 +178,40 @@ values to a CSV, and load exactly that set with `--gids`. Grizz resolves the gid
 to full company data (free, no credits), then runs the normal match → update →
 create flow — so discovery/refinement stays in the MCP and the bulk write runs
 here, out of any model context.
+
+**Load an existing CRM backlog — `lookup` then `write`:**
+
+```bash
+# 1. Which of these does Grizz already know?  Read-only, no credits.
+python run.py lookup --input backlog.jsonl --out hits.jsonl --companies payloads.json
+
+# 2. Write those hits back onto the same CRM records, keyed by record id.
+python run.py write --crm hubspot --results hits.jsonl --companies payloads.json --dry-run
+python run.py write --crm hubspot --results hits.jsonl --companies payloads.json
+```
+
+`lookup --input` takes a `.jsonl` of `{"domain": ..., "crm_record_id": ...}` rows, a
+CSV with a `domain`/`gid_company` column, or a plain one-per-line domain list. Give
+each row its `crm_record_id` and that id round-trips into `--out`, so `write` can
+update **exactly** the record you looked up.
+
+| Flag (`write`) | Description |
+|---|---|
+| `--results` | The per-record JSONL `lookup --out` wrote (required) |
+| `--companies` | The payloads `lookup --companies` wrote. Omit it and they are re-fetched from Grizz — read-only, no credits |
+| `--crm` | CRM to write to: `salesforce`, `hubspot`, or `attio` |
+| `--config` | Path to config file (default: `config.yaml`) |
+| `--batch-size` | Records per CRM batch write (default: `200`, max: `200`) |
+| `--dry-run` | Preview without writing to the CRM |
+
+`write` is **update-only**: every row is a record that already exists in your CRM, so
+this path cannot create a duplicate, and it only writes `grizz_*` fields — native
+fields are never touched. Matched rows with no `crm_record_id`, and rows with no
+company payload, are reported and skipped rather than guessed at.
+
+Use `write` rather than `audience --gids` whenever the list came from `lookup`:
+`--gids` re-matches by domain search, which can miss a record your CRM stores as
+`www.foo.com` when Grizz holds `foo.com`. Writing by record id cannot miss.
 
 ### Run one push at a time
 
