@@ -95,7 +95,7 @@ def _headers(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
-# Canonical cascade-input keys (see the Grizz API docs §10).  submit() and
+# Canonical cascade-input keys (see the Grizz API docs).  submit() and
 # submit_bulk() only forward keys present in this set, so callers can pass
 # entire CRM-derived dicts without scrubbing extras.
 LOOKUP_BATCH_MAX = 5000   # server-side cap on one lookup-batch call
@@ -110,7 +110,7 @@ def _cascade_payload(company: dict) -> dict:
     """Pull only the cascade-input keys out of `company`, dropping empties.
 
     `domain` is normalized through `clean_domain` because NO server-side match
-    endpoint normalizes it (see the Grizz API docs §10) — a dirty `https://www.x.com/`
+    endpoint normalizes it (see the Grizz API docs) — a dirty `https://www.x.com/`
     silently misses a company Grizz knows.  The adapters already cleaned domains
     on the way out of a CRM, but CSV- and file-fed callers (`run.py lookup`,
     `_resolve_gids`) never touched an adapter, so they sent raw values straight
@@ -129,7 +129,7 @@ def _cascade_payload(company: dict) -> dict:
 def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
     """Submit a single enrichment request.
 
-    Pass any of the cascade-input fields (see the Grizz API docs §10):
+    Pass any of the cascade-input fields (see the Grizz API docs):
         gid_company, grizz_id, domain, company_name,
         hq_city, hq_state, hq_country, hq_phone
 
@@ -150,7 +150,7 @@ def submit_bulk(api_key: str, companies: list[dict]) -> dict:
     Each entry may carry any of the cascade-input keys
     (gid_company, grizz_id, domain, company_name, hq_city, hq_state,
     hq_country, hq_phone).  Server enforces the soft-cap to the org's
-    remaining monthly budget — see the Grizz API docs §10 + the
+    remaining monthly budget — see the Grizz API docs and the
     /api/v1/companies/enrich-bulk/ endpoint docs.  Returns the bulk
     response body verbatim:
 
@@ -631,7 +631,7 @@ def create_in_crm(
     field, and POSTs to the customer's CRM (Salesforce composite/sobjects
     or HubSpot batch/create).  Returns per-record outcome with new crm_ids.
 
-    Up to 5000 records per call; credentials live only in the Grizz backend worker
+    Up to 5000 records per call; credentials live only in server worker
     memory.  Returns the response body verbatim from
     POST /api/v1/companies/create-crm/.
     """
@@ -665,7 +665,7 @@ def fetch_results(api_key: str, request_id: str) -> dict:
 def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) -> dict | None:
     """Run the full submit → poll → fetch cycle for a single company.
 
-    Accepts any of the cascade-input keys (see the Grizz API docs §10):
+    Accepts any of the cascade-input keys (see the Grizz API docs):
         gid_company, grizz_id, domain, company_name,
         hq_city, hq_state, hq_country, hq_phone
 

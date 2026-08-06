@@ -19,10 +19,8 @@ This project uses [Semantic Versioning](https://semver.org/).
   Deduplicates on the cascade key first, so a large backlog costs one call
   per 5,000 *distinct* companies rather than per row.
 
-  This capability existed only as separate one-off scripts outside
-  the package (byte-identical, calling the REST endpoint directly) because
-  the CLI offered no equivalent. `lookup_batch`
-  was reachable in the library but only as an internal step inside `audience`.
+  The underlying `lookup_batch` was already reachable in the library, but only
+  as an internal step inside `audience` — there was no command that exposed it.
 
 ### Fixed
 - **Dirty domains no longer silently miss.** `POST /api/v1/companies/lookup-batch/`
@@ -32,8 +30,8 @@ This project uses [Semantic Versioning](https://semver.org/).
   `grizz_client._cascade_payload` did not — so CSV- and file-fed callers
   (`_resolve_gids`, and now `lookup`) sent raw values straight through.
   Normalization now happens in `_cascade_payload`, covering every cascade path
-  at once. Measured on a large HubSpot backlog: 0.3–0.7% of `domain`
-  values are dirty; cleaning them recovers in-ICP matches that were previously invisible.
+  at once. A small but real share of `domain` values in a typical CRM export are
+  dirty; cleaning them recovers in-ICP matches that were previously invisible.
 
   Note for callers: the `input` echoed back by the endpoint now carries the
   **cleaned** domain, so results must be keyed on `clean_domain(...)`, not on
@@ -43,8 +41,8 @@ This project uses [Semantic Versioning](https://semver.org/).
 ### Changed
 - **One canonical `clean_domain`.** Extracted to `grizz_enrichment/domain_utils.py`
   and imported by all three adapters, which each carried a byte-identical private
-  `_clean_domain` plus its own `_URL_PREFIXES`. Any separately kept
-  copy of `domain_utils.py` should now import from the package.
+  `_clean_domain` plus its own `_URL_PREFIXES`. Any caller that needs domain
+  normalization should import it from the package rather than re-implement it.
 - **`grizz_client.lookup_batch` chunks and retries internally.** Inputs over the
   5,000 server cap are split and concatenated automatically, and transient
   429/5xx go through `_request`'s jittered backoff instead of a bare
@@ -279,7 +277,7 @@ server-side orchestrated — the MCP holds no CRM read/write logic.
 
 ### Changed
 - **BREAKING — endpoint renames (no redirects).**  All `/api/v1/*` paths
-  brought into line with the canonical noun convention in the Grizz API docs §2.
+  brought into line with the canonical noun convention in the Grizz API docs.
   Customers calling the API directly must update their URLs:
 
       /api/v1/enrichment/             → /api/v1/companies/enrich/
@@ -290,7 +288,7 @@ server-side orchestrated — the MCP holds no CRM read/write logic.
       /api/v1/admin/crm-coverage-reports/ → /api/v1/admin/crm-coverage/
       /api/v1/admin/crm-mappings/     → /api/v1/admin/crm-field-mappings/
 
-  Old paths return 404.  See the Grizz API docs §11 (Tool ↔ Endpoint Mapping)
+  Old paths return 404.  See the Grizz API docs (Tool ↔ Endpoint Mapping)
   for the full table.
 
 ---

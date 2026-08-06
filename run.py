@@ -430,8 +430,8 @@ def run_lookup(input_path: Path, out: Path | None, companies_out: Path | None) -
         console.print(f"[red]No lookup inputs found in {input_path}.[/red]")
         raise typer.Exit(1)
 
-    # Deduplicate on the cascade key so a large backlog costs one call per
-    # 5000 DISTINCT companies, not per row.
+    # Deduplicate on the cascade key so a large backlog costs one call per 5000
+    # DISTINCT companies, not per row.
     lookups: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for r in rows:
@@ -1702,7 +1702,7 @@ def people_sync(
     enrich_phone: bool = typer.Option(False, "--enrich-phone", help="Enrich phone before sync (spends credits)"),
     enrich_batch_size: int = typer.Option(50, "--enrich-batch-size", help="Contacts per enrich chunk (<=50 keeps each chunk inside the poll window)."),
     poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
-    poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running the same command (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (the upstream provider retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
+    poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running the same command (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (upstream retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
     batch_size: int = typer.Option(100, "--batch-size", help="Person records per write batch (attio only; the adapter parallelizes each batch)."),
     fuzzy_threshold: float = typer.Option(0.9, "--fuzzy-threshold", help="Attio only. Min confidence to auto-merge a FUZZY name match (grizz_person_id/email/linkedin matches always merge). Fuzzy matches below this are surfaced for review, not written. Set 0 to accept all, 1.01 to never auto-merge a fuzzy match."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),

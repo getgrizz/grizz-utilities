@@ -2,16 +2,15 @@
 
 ONE implementation, used by every path that sends a domain to Grizz or
 searches a CRM by domain.  It previously existed as a private `_clean_domain`
-in each of the three adapters and — because callers that bypass an adapter
-get no normalization at all — as a separate copy of `domain_utils.py` in other
-repos too.  The copies drifted in reach, not in logic: the adapters applied it,
-`grizz_client`'s cascade path did not.
+in each of the three adapters, and any caller that bypassed an adapter had no
+normalization at all.  The copies drifted in reach, not in logic: the adapters
+applied it, `grizz_client`'s cascade path did not.
 
 Why it matters: `POST /api/v1/companies/lookup-batch/` does NOT normalize its
 input.  A stored CRM domain of `https://www.example.com/` comes back
-`matched:false` for a company Grizz knows perfectly well.  Measured on a large
-HubSpot backlog, 0.3-0.7% of `domain` values are dirty this way; cleaning them
-recovers in-ICP matches that were previously invisible.
+`matched:false` for a company Grizz knows perfectly well.  A small but real
+share of `domain` values in a typical CRM export are dirty this way; cleaning
+them recovers in-ICP matches that were previously invisible.
 """
 
 _URL_PREFIXES = ("https://", "http://", "www.")
