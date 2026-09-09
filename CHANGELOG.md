@@ -41,6 +41,24 @@ This project uses [Semantic Versioning](https://semver.org/).
   `crm_record_id`, and rows with no company payload, are reported and skipped.
 
 ### Fixed
+- **The CLI now stamps `last_sync` on company records.** `setup` has created the
+  field since 2026-05-24 (`grizz_last_sync` / `Grizz_Last_Sync__c`), but no CLI
+  write path ever filled it on Salesforce or HubSpot — neither adapter contained
+  any timestamp code, and the company `field_mapping` had no key for it. So every
+  record loaded through `enrich` or `audience` read as never-synced no matter how
+  recently it landed, and any freshness view built on the field (never synced /
+  stale / fresh) was wrong for CLI-loaded records. `enrich`, `audience` and
+  `write` now all stamp it, once per run so a push reads as a single sync event.
+  Config-driven like every other field: it reaches the CRM only if `config.yaml`
+  maps `last_sync`, so nothing is written to a workspace that has no such
+  attribute. Attio is unchanged by default — `setup --crm attio` does not create
+  a last-sync attribute and writing an unknown slug 400s the whole record, so the
+  example config leaves it commented out and the adapter's own
+  `GRIZZ_STAMP_LAST_SYNC=1` stamp still applies.
+
+  Records the CLI does not write are still not stamped — an `enrich` that finds
+  no data does not touch the record, so "Grizz looked and had nothing to add"
+  remains indistinguishable from "never synced" on this path.
 - **`audience --gids` no longer silently discards a lookup JSONL.** `_read_gids`
   parsed every input with `csv.reader`, so a `lookup --out` file was split on the
   commas *inside* each JSON object: cell 0 came back as `{"record_id": ""`, the

@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -150,6 +151,7 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
     # comes from concurrency; the adapters' requests.Session is thread-safe.
     # Dry-run stays single-threaded for a readable, ordered preview.
     total = len(account_ids)
+    sync_ts = _sync_timestamp()
 
     def _process(account_id: str) -> tuple[str, str, str]:
         """Enrich one account end-to-end (get domain → Grizz → write).
@@ -169,7 +171,9 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
             return (account_id, "error", str(e))
         if grizz_data is None:
             return (account_id, "no_data", domain)
-        updates = apply_mapping(grizz_data, field_mapping)
+        # Stamped only when the record is actually written, and only if
+        # config.yaml maps `last_sync` — see _grizz_data.
+        updates = apply_mapping({**grizz_data, "last_sync": sync_ts}, field_mapping)
         if not updates:
             return (account_id, "no_updates", domain)
         if dry_run:
@@ -329,13 +333,27 @@ def _first_naics(value: str | None) -> str | None:
     return value.split(",")[0].strip()[:6] or None
 
 
-def _grizz_data(company: dict) -> dict:
+def _sync_timestamp() -> str:
+    """UTC stamp for the `last_sync` field, in the one ISO-8601 form Salesforce
+    DateTime, HubSpot datetime and Attio all accept.  Computed once per run so
+    every record in a push carries the same value."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _grizz_data(company: dict, sync_ts: str | None = None) -> dict:
     """Normalize a Grizz company payload to the flat grizz_* shape `apply_mapping`
     expects.  Accepts either payload dialect: the audience-result shape
     (phone/email) and the raw lookup-batch shape (hq_phone/hq_email), so an
-    audience push and a lookup push write the same fields from the same code."""
+    audience push and a lookup push write the same fields from the same code.
+
+    `last_sync` is CONFIG-DRIVEN like every other field: it only reaches the CRM
+    if config.yaml maps it, because `apply_mapping` emits nothing for an unmapped
+    key.  Nothing here hardcodes a slug, so a workspace without the attribute is
+    never sent one (which is what 400s a whole record on Attio).
+    """
     grizz_id = company.get("grizz_id") or company.get("company_id")
     return {
+        "last_sync":    sync_ts,
         "grizz_id":     grizz_id,
         "gid_company":  company.get("gid_company"),
         "grizz_url":    company.get("grizz_url") or (f"https://getgrizz.com/company/{grizz_id}" if grizz_id else None),
@@ -742,13 +760,14 @@ def run_write(
 
     # ── Build the id-keyed update records ───────────────────────────────────
     records, unresolved = [], []
+    sync_ts = _sync_timestamp()
     for r in writable:
         company = (payloads.get(str(r.get("gid_company") or "").strip())
                    or payloads.get(r.get("clean_domain") or clean_domain(r.get("domain")) or ""))
         if not company:
             unresolved.append(r)
             continue
-        mapped = apply_mapping(_grizz_data(company), field_mapping)
+        mapped = apply_mapping(_grizz_data(company, sync_ts), field_mapping)
         if not mapped:
             unresolved.append(r)
             continue
@@ -965,6 +984,8 @@ def run_audience(
     console.print()
 
     # ── Update matched accounts (batched) ────────────────────────────────────
+    # One stamp for the whole run, so a push reads as a single sync event.
+    sync_ts = _sync_timestamp()
     updated = 0
     if matched:
         console.print(f"Updating {len(matched)} matched account(s)...")
@@ -972,7 +993,7 @@ def run_audience(
         # Build all update records first
         records_to_update = []
         for company, account_id in matched:
-            mapped = apply_mapping(_grizz_data(company), field_mapping)
+            mapped = apply_mapping(_grizz_data(company, sync_ts), field_mapping)
             if not mapped:
                 continue
             records_to_update.append({"Id": account_id, **mapped})
@@ -1016,7 +1037,7 @@ def run_audience(
             # Build all records first
             records_to_create = []
             for company in unmatched:
-                mapped = apply_mapping(_grizz_data(company), field_mapping)
+                mapped = apply_mapping(_grizz_data(company, sync_ts), field_mapping)
                 if crm == "salesforce":
                     if company.get("company_name"):
                         mapped.setdefault("Name", company["company_name"])

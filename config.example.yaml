@@ -54,6 +54,12 @@ salesforce:
     # ── Other Technology Signals ───────────────────────────────────────────────
     other_tech_signals: Grizz_Other_Tech_Signals__c
 
+    # ── Sync Timestamp ─────────────────────────────────────────────────────────
+    # Stamped (UTC) on every record this tool writes — enrich, audience and
+    # write alike. Remove the line to stop stamping; it is written only if
+    # mapped here. `setup` creates the field.
+    last_sync:          Grizz_Last_Sync__c
+
 
 # ── HubSpot ────────────────────────────────────────────────────────────────────
 # Run `python run.py setup --crm hubspot` to create these properties first.
@@ -101,6 +107,12 @@ hubspot:
 
     # ── Other Technology Signals ───────────────────────────────────────────────
     other_tech_signals:    grizz_other_tech_signals
+
+    # ── Sync Timestamp ─────────────────────────────────────────────────────────
+    # Stamped (UTC) on every record this tool writes — enrich, audience and
+    # write alike. Remove the line to stop stamping; it is written only if
+    # mapped here. `setup` creates the property.
+    last_sync:             grizz_last_sync
 
 
 # ── Attio ────────────────────────────────────────────────────────────────────
@@ -166,6 +178,13 @@ attio:
 
     # ── Other Technology Signals ───────────────────────────────────────────────
     other_tech_signals:    grizz_other_tech_signals
+
+    # ── Sync Timestamp ─────────────────────────────────────────────────────────
+    # Attio only: `setup --crm attio` does NOT create a last-sync attribute, and
+    # writing a slug the workspace doesn't have 400s the whole record. Map this
+    # ONLY if you built the attribute yourself. The adapter also has its own
+    # stamp, opt-in via GRIZZ_STAMP_LAST_SYNC=1, which wins if both are on.
+    # last_sync:           grizz_last_sync
 
 
 # ── Attio — People (contacts) ─────────────────────────────────────────────────
