@@ -315,6 +315,7 @@ _AUDIENCE_CSV_COLUMNS = [
     "hq_city", "hq_region", "hq_country",
     "employee_range", "revenue_range",
     "naics", "grizz_activity",
+    "company_tags",
     "erp_tech_stack", "erp_match_type", "erp_keyword_usage",
     "ats_tech_stack", "ats_match_type", "ats_keyword_usage",
     "other_tech_signals",
@@ -350,6 +351,9 @@ def _grizz_data(company: dict) -> dict:
         "employee_range": company.get("employee_range"),
         "naics_code":   _first_naics(company.get("naics")),
         "grizz_activity": company.get("grizz_activity"),
+        # Behavioral tags, comma-separated (e.g. "multi-trade, self-performing").
+        # Like every other key here it only reaches the CRM if config.yaml maps it.
+        "company_tags":  company.get("company_tags"),
         "revenue_range": company.get("revenue_range"),
         "erp_tech_stack":    company.get("erp_tech_stack"),
         "erp_match_type":    company.get("erp_match_type"),

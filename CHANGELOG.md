@@ -10,6 +10,14 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **`company_tags` on company payloads.** Behavioral company tags — a
+  comma-separated list such as `"multi-trade, self-performing"` — now come back
+  on every company record and sync to the CRM alongside the other `grizz_*`
+  fields. `setup` provisions `Grizz_Company_Tags__c` (Salesforce) and
+  `grizz_company_tags` (HubSpot); Attio's slug is mapped in
+  `config.example.yaml`. As with every field, it only reaches the CRM if your
+  `config.yaml` maps it, so an existing config keeps its current behavior until
+  you add the line. Also added to the audience CSV.
 - **`run.py lookup` — read-only DB lookup over a company list.** The cheap first
   pass over a large CRM backlog: it reports which companies Grizz already knows
   without creating `EnrichmentRequest` rows or charging credits, so `enrich` is

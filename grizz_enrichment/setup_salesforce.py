@@ -81,6 +81,15 @@ GRIZZ_FIELDS = [
         "Metadata": {"type": "Text", "label": "Grizz Activity", "length": 255, "required": False},
     },
 
+    # ── Behavioral tags ────────────────────────────────────────────────────────
+    # Comma-separated list (e.g. "multi-trade, self-performing"), so Text rather
+    # than a picklist — the tag set grows upstream and a fixed value set would
+    # need re-provisioning every time it does.
+    {
+        "FullName": "Account.Grizz_Company_Tags__c",
+        "Metadata": {"type": "Text", "label": "Grizz Company Tags", "length": 255, "required": False},
+    },
+
     # ── ERP Intelligence ───────────────────────────────────────────────────────
     {
         "FullName": "Account.Grizz_ERP__c",

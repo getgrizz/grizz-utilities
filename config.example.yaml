@@ -37,6 +37,10 @@ salesforce:
     naics_code:      Grizz_NAICS__c
     grizz_activity:  Grizz_Activity__c
 
+    # ── Behavioral Tags ────────────────────────────────────────────────────────
+    # Comma-separated (e.g. "multi-trade, self-performing"). `setup` creates it.
+    company_tags:    Grizz_Company_Tags__c
+
     # ── ERP Intelligence ───────────────────────────────────────────────────────
     erp_tech_stack:    Grizz_ERP__c
     erp_match_type:     Grizz_ERP_Match_Type__c
@@ -80,6 +84,10 @@ hubspot:
     revenue_range:         grizz_revenue_range
     naics_code:            grizz_naics
     grizz_activity:        grizz_activity
+
+    # ── Behavioral Tags ────────────────────────────────────────────────────────
+    # Comma-separated (e.g. "multi-trade, self-performing"). `setup` creates it.
+    company_tags:          grizz_company_tags
 
     # ── ERP Intelligence ───────────────────────────────────────────────────────
     erp_tech_stack:        grizz_erp
@@ -139,6 +147,12 @@ attio:
     revenue_range:         grizz_revenue_range
     naics_code:            grizz_naics
     grizz_activity:        grizz_activity_classification
+
+    # ── Behavioral Tags ────────────────────────────────────────────────────────
+    # Comma-separated (e.g. "multi-trade, self-performing"). Plain text, so no
+    # `field_types` entry is needed; declare one only if you build it as a
+    # multi-select in your workspace.
+    company_tags:          grizz_company_tags
 
     # ── ERP Intelligence ───────────────────────────────────────────────────────
     erp_tech_stack:        grizz_erp_software

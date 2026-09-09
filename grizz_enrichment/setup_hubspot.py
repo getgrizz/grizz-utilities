@@ -141,6 +141,18 @@ GRIZZ_PROPERTIES = [
         "groupName": "grizz",
     },
 
+    # ── Behavioral tags ────────────────────────────────────────────────────────
+    # Comma-separated list (e.g. "multi-trade, self-performing"), so a single
+    # text field rather than a multi-select — the tag set grows upstream and a
+    # fixed option list would need re-provisioning every time it does.
+    {
+        "name":      "grizz_company_tags",
+        "label":     "Grizz Company Tags",
+        "type":      "string",
+        "fieldType": "text",
+        "groupName": "grizz",
+    },
+
     # ── ERP Intelligence ───────────────────────────────────────────────────────
     {
         "name":      "grizz_erp",
