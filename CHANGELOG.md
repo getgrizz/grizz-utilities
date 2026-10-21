@@ -9,6 +9,14 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **`write` / `audience` dropped HQ location and NAICS from enrich payloads.**
+  `_grizz_data` read only the lookup/audience keys (`hq_city`, `hq_region`,
+  `hq_country`, `naics`), so an enrich result (`city`, `state_province_region`,
+  `country`, `naics_code`) pushed through `write --companies` lost those four
+  fields before `config.yaml` was applied. Both dialects are now accepted;
+  lookup and audience output is unchanged.
+
 ### Added
 - **`company_tags` on company payloads.** Behavioral company tags — a
   comma-separated list such as `"multi-trade, self-performing"` — now come back

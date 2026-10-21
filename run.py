@@ -363,11 +363,12 @@ def _grizz_data(company: dict, sync_ts: str | None = None) -> dict:
         "company_description": company.get("company_description"),
         "phone":        company.get("phone") or company.get("hq_phone"),
         "email":        company.get("email") or company.get("hq_email"),
-        "city":         company.get("hq_city"),
-        "state_province_region": company.get("hq_region"),
-        "country":      company.get("hq_country"),
+        # Lookup/audience payloads use hq_*/naics; enrich payloads use the flat names.
+        "city":         company.get("hq_city") or company.get("city"),
+        "state_province_region": company.get("hq_region") or company.get("state_province_region"),
+        "country":      company.get("hq_country") or company.get("country"),
         "employee_range": company.get("employee_range"),
-        "naics_code":   _first_naics(company.get("naics")),
+        "naics_code":   _first_naics(company.get("naics") or company.get("naics_code")),
         "grizz_activity": company.get("grizz_activity"),
         # Behavioral tags, comma-separated (e.g. "multi-trade, self-performing").
         # Like every other key here it only reaches the CRM if config.yaml maps it.
