@@ -33,6 +33,8 @@ salesforce:
 
     # ── Firmographics ──────────────────────────────────────────────────────────
     employee_range:  Grizz_Employee_Range__c
+    employee_count:  Grizz_Employee_Count__c     # point count; can fall outside the range
+    year_founded:    Grizz_Year_Founded__c
     revenue_range:   Grizz_Revenue_Range__c
     naics_code:      Grizz_NAICS__c
     grizz_activity:  Grizz_Activity__c
@@ -87,6 +89,8 @@ hubspot:
 
     # ── Firmographics ──────────────────────────────────────────────────────────
     employee_range:        grizz_employee_range
+    employee_count:        grizz_employee_count     # point count; can fall outside the range
+    year_founded:          grizz_year_founded
     revenue_range:         grizz_revenue_range
     naics_code:            grizz_naics
     grizz_activity:        grizz_activity

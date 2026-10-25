@@ -317,7 +317,7 @@ _AUDIENCE_CSV_COLUMNS = [
     "grizz_id", "gid_company", "grizz_url", "company_name", "domain", "linkedin_url",
     "phone", "email",
     "hq_city", "hq_region", "hq_country",
-    "employee_range", "revenue_range",
+    "employee_range", "employee_count", "year_founded", "revenue_range",
     "naics", "grizz_activity",
     "company_tags",
     "erp_tech_stack", "erp_match_type", "erp_keyword_usage",
@@ -368,6 +368,8 @@ def _grizz_data(company: dict, sync_ts: str | None = None) -> dict:
         "state_province_region": company.get("hq_region") or company.get("state_province_region"),
         "country":      company.get("hq_country") or company.get("country"),
         "employee_range": company.get("employee_range"),
+        "employee_count": company.get("employee_count"),
+        "year_founded":   company.get("year_founded"),
         "naics_code":   _first_naics(company.get("naics") or company.get("naics_code")),
         "grizz_activity": company.get("grizz_activity"),
         # Behavioral tags, comma-separated (e.g. "multi-trade, self-performing").
@@ -1113,7 +1115,35 @@ _DISCOVERY_CSV_FIELDS = [
     "department", "company", "company_gid", "crm_company_record_id",
     "crm_name", "company_domain", "city", "state", "country",
     "linkedin_url", "fallback", "email_entitled", "phone_entitled",
+    "email", "email_status",
+    "phone", "phone_confidence", "phone_connect_rate", "phone_line_type",
+    "mobile_phone", "mobile_phone_confidence", "mobile_phone_connect_rate",
+    "direct_phone", "direct_phone_confidence", "direct_phone_connect_rate",
 ]
+
+# Contact detail the API returns beside email/phone, as {api key: CLI key}.  The
+# CLI keys are the ones config.yaml maps (the best phone is plain `phone`, so its
+# scores drop the `primary_` prefix).  Blank means unknown: confidence exists only
+# for confirmed ownership and connect rate only for active US/CA mobiles.
+_CONTACT_DETAIL_KEYS = {
+    "email_status":               "email_status",
+    "primary_phone_confidence":   "phone_confidence",
+    "primary_phone_connect_rate": "phone_connect_rate",
+    "primary_phone_line_type":    "phone_line_type",
+    "mobile_phone":               "mobile_phone",
+    "mobile_phone_confidence":    "mobile_phone_confidence",
+    "mobile_phone_connect_rate":  "mobile_phone_connect_rate",
+    "direct_phone":               "direct_phone",
+    "direct_phone_confidence":    "direct_phone_confidence",
+    "direct_phone_connect_rate":  "direct_phone_connect_rate",
+}
+
+
+def _contact_detail(row: dict) -> dict:
+    """The contact-detail keys present on an API person row, renamed to the CLI
+    keys.  Only keys the row carries are returned, so an email-only result never
+    blanks phone detail picked up earlier."""
+    return {cli: row[api] for api, cli in _CONTACT_DETAIL_KEYS.items() if api in row}
 
 
 def _norm_header(h: str) -> str:
@@ -1306,6 +1336,7 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
                 continue
             owner = owners[0]  # attribute to the first CRM record when duplicates share a gid
             row = dict(m)
+            row.update(_contact_detail(m))
             row["crm_company_record_id"] = owner["record_id"]
             row["crm_name"] = owner["name"] or m.get("company") or ""
             row["company_domain"] = owner["domain"] or ""
@@ -1628,8 +1659,9 @@ def _person_name(p: dict) -> dict | None:
 
 def _enrich_people_map(api_key: str, gids: list[str], enrich_email: bool, enrich_phone: bool,
                        batch_size: int, poll_interval: int, poll_timeout: int) -> dict:
-    """Enrich email/phone in chunks and RETURN {gid: {'email':.., 'phone':..}} so
-    the client-side Attio write can put fresh email/phone on the person record.
+    """Enrich email/phone in chunks and RETURN {gid: {'email':.., 'phone':..,
+    <contact detail>}} so the client-side Attio write can put fresh email/phone,
+    email status and the phone scores / mobile / direct on the person record.
 
     Same settle-aware, chunked polling as the server-path enrich — only values
     from settled chunks are returned; an unsettled chunk is called out for a
@@ -1660,6 +1692,7 @@ def _enrich_people_map(api_key: str, gids: list[str], enrich_email: bool, enrich
                 got["email"] = r["email"]
             if r.get("phone"):
                 got["phone"] = r["phone"]
+            got.update(_contact_detail(r))
         if settled:
             console.print(f"[green]complete[/green] — found_email={final.get('found_email', 0)} "
                           f"found_phone={final.get('found_phone', 0)}")
@@ -1852,6 +1885,8 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
         raise typer.Exit(1)
 
     records = _read_person_records(contacts_path)
+    for r in records:      # contacts.json written before the CLI renamed detail keys
+        r.update(_contact_detail(r))
     if not records:
         console.print(f"[red]No contacts found in {contacts_path}.[/red]")
         raise typer.Exit(1)
@@ -1869,6 +1904,7 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
                 r["email"] = got["email"]
             if got.get("phone"):
                 r["phone"] = got["phone"]
+            r.update({k: v for k, v in got.items() if k not in ("email", "phone")})
 
     # ── connect the People adapter ───────────────────────────────────────────
     adapter = AttioContactAdapter()

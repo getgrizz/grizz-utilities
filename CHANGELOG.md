@@ -31,8 +31,16 @@ This project uses [Semantic Versioning](https://semver.org/).
   - Attio: mapped with their types in `config.example.yaml`.
   HubSpot phone properties are `text`, like `grizz_contact_phone`, because the
   `phonenumber` type rejects non-E.164 values and fails the whole batch.
-  Re-running `setup` is safe — existing properties are skipped. Populating
-  these fields from the CLI comes in a later release.
+  Re-running `setup` is safe — existing properties are skipped.
+- **The CLI writes them.** Company pushes (`enrich`, `audience`, `write`) carry
+  `employee_count` and `year_founded`, and the HubSpot / Salesforce examples
+  in `config.example.yaml` now map them. `people discover` adds email, email
+  status, the best phone with its scores, and mobile / direct numbers to
+  `contacts_review.csv` and `contacts.json` (filled only for contacts you
+  already hold); `people sync --crm attio` writes them, refreshing them from
+  `--enrich-email` / `--enrich-phone`. HubSpot / Salesforce contact sync runs
+  server-side and writes them once `setup` is re-run and field mappings are
+  re-seeded. Add the new keys to your own `config.yaml` to turn them on.
 - **`company_tags` on company payloads.** Behavioral company tags — a
   comma-separated list such as `"multi-trade, self-performing"` — now come back
   on every company record and sync to the CRM alongside the other `grizz_*`
