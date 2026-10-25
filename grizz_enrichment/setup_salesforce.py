@@ -69,6 +69,14 @@ GRIZZ_FIELDS = [
         "Metadata": {"type": "Text", "label": "Grizz Employee Range", "length": 50, "required": False},
     },
     {
+        "FullName": "Account.Grizz_Employee_Count__c",
+        "Metadata": {"type": "Number", "label": "Grizz Employee Count", "precision": 9, "scale": 0, "required": False},
+    },
+    {
+        "FullName": "Account.Grizz_Year_Founded__c",
+        "Metadata": {"type": "Number", "label": "Grizz Year Founded", "precision": 4, "scale": 0, "required": False},
+    },
+    {
         "FullName": "Account.Grizz_Revenue_Range__c",
         "Metadata": {"type": "Text", "label": "Grizz Revenue Range", "length": 50, "required": False},
     },

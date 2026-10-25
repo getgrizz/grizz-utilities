@@ -120,6 +120,22 @@ GRIZZ_PROPERTIES = [
         "groupName": "grizz",
     },
     {
+        "name":      "grizz_employee_count",
+        "label":     "Grizz Employee Count",
+        "type":      "number",
+        "fieldType": "number",
+        "groupName": "grizz",
+        "description": "Point employee count.",
+    },
+    {
+        "name":      "grizz_year_founded",
+        "label":     "Grizz Year Founded",
+        "type":      "number",
+        "fieldType": "number",
+        "groupName": "grizz",
+        "description": "Year the company was founded.",
+    },
+    {
         "name":      "grizz_revenue_range",
         "label":     "Grizz Revenue Range",
         "type":      "string",

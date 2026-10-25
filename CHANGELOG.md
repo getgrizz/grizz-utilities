@@ -18,6 +18,21 @@ This project uses [Semantic Versioning](https://semver.org/).
   lookup and audience output is unchanged.
 
 ### Added
+- **Phone detail and email status on contacts; employee count and year
+  founded on companies.** `setup` now provisions:
+  - Contacts: email status; the best phone's confidence (0-100), connect rate
+    and line type; and a mobile and a direct number, each with its own
+    confidence and connect rate (`grizz_contact_*` on HubSpot,
+    `Grizz_Contact_*__c` on Salesforce). Confidence is only present for
+    numbers with confirmed ownership and connect rate only for active US/CA
+    mobiles, so blanks are normal.
+  - Companies: `grizz_employee_count` / `Grizz_Employee_Count__c` and
+    `grizz_year_founded` / `Grizz_Year_Founded__c`.
+  - Attio: mapped with their types in `config.example.yaml`.
+  HubSpot phone properties are `text`, like `grizz_contact_phone`, because the
+  `phonenumber` type rejects non-E.164 values and fails the whole batch.
+  Re-running `setup` is safe — existing properties are skipped. Populating
+  these fields from the CLI comes in a later release.
 - **`company_tags` on company payloads.** Behavioral company tags — a
   comma-separated list such as `"multi-trade, self-performing"` — now come back
   on every company record and sync to the CRM alongside the other `grizz_*`

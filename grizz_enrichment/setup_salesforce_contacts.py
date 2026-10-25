@@ -73,6 +73,46 @@ GRIZZ_FIELDS = [
         "FullName": "Contact.Grizz_Contact_Last_Sync__c",
         "Metadata": {"type": "DateTime", "label": "Grizz Contact Last Sync"},
     },
+    {
+        "FullName": "Contact.Grizz_Contact_Email_Status__c",
+        "Metadata": {"type": "Text", "label": "Grizz Contact Email Status", "length": 32, "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Phone_Confidence__c",
+        "Metadata": {"type": "Number", "label": "Grizz Contact Phone Confidence", "precision": 3, "scale": 0, "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Phone_Connect_Rate__c",
+        "Metadata": {"type": "Text", "label": "Grizz Contact Phone Connect Rate", "length": 32, "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Phone_Line_Type__c",
+        "Metadata": {"type": "Text", "label": "Grizz Contact Phone Line Type", "length": 32, "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Mobile_Phone__c",
+        "Metadata": {"type": "Phone", "label": "Grizz Contact Mobile Phone", "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Mobile_Phone_Confidence__c",
+        "Metadata": {"type": "Number", "label": "Grizz Contact Mobile Phone Confidence", "precision": 3, "scale": 0, "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Mobile_Phone_Connect_Rate__c",
+        "Metadata": {"type": "Text", "label": "Grizz Contact Mobile Phone Connect Rate", "length": 32, "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Direct_Phone__c",
+        "Metadata": {"type": "Phone", "label": "Grizz Contact Direct Phone", "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Direct_Phone_Confidence__c",
+        "Metadata": {"type": "Number", "label": "Grizz Contact Direct Phone Confidence", "precision": 3, "scale": 0, "required": False},
+    },
+    {
+        "FullName": "Contact.Grizz_Contact_Direct_Phone_Connect_Rate__c",
+        "Metadata": {"type": "Text", "label": "Grizz Contact Direct Phone Connect Rate", "length": 32, "required": False},
+    },
 ]
 
 PERMISSION_SET_NAME = "Grizz_Enrichment"
