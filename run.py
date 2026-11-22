@@ -32,7 +32,6 @@ from grizz_enrichment.adapters import ADAPTERS, CONTACT_ADAPTERS
 from grizz_enrichment.adapters.attio import AttioAdapter, AttioContactAdapter
 from grizz_enrichment.audience_client import fetch_audience, submit as submit_audience
 from grizz_enrichment.domain_utils import clean_domain
-from grizz_enrichment.grizz_client import enrich as grizz_enrich
 from grizz_enrichment.mapper import apply_mapping
 from grizz_enrichment.setup_salesforce import run_setup as run_setup_salesforce
 from grizz_enrichment.setup_hubspot import run_setup as run_setup_hubspot
@@ -166,9 +165,13 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         try:
             # No per-poll on_status spinner — interleaved \r writes are unreadable
             # across threads.
-            grizz_data = grizz_enrich(grizz_api_key, domain)
+            res = grizz_client.enrich_detailed(grizz_api_key, domain)
         except Exception as e:
             return (account_id, "error", str(e))
+        if res["outside_plan"]:
+            # In Grizz, but not in this account's plan: nothing to write, don't re-enrich it.
+            return (account_id, "outside_plan", domain)
+        grizz_data = res["company"]
         if grizz_data is None:
             return (account_id, "no_data", domain)
         # Stamped only when the record is actually written, and only if
@@ -217,6 +220,7 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         "no_data": "yellow",
         "skipped": "yellow",
         "no_updates": "yellow",
+        "outside_plan": "magenta",
         "error": "red",
     }
 
@@ -231,6 +235,11 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         f"\n[bold]Done:[/bold] {success_count}/{len(account_ids)} "
         f"{'previewed' if dry_run else 'updated'}."
     )
+    outside = sum(1 for _, o, _ in summary if o == "outside_plan")
+    if outside:
+        console.print(f"[magenta]{outside} account(s) are in Grizz but outside your plan[/magenta] "
+                      f"(no data written; each still counted as an enrichment call). "
+                      f"Contact Grizz to expand your plan.")
 
 
 # ── Audience → CRM logic ───────────────────────────────────────────────────────
@@ -565,6 +574,7 @@ def run_lookup(input_path: Path, out: Path | None, companies_out: Path | None) -
         by_key[(inp.get("gid_company") or "", clean_domain(inp.get("domain")) or "")] = m
 
     hits = 0
+    outside = 0
     via: dict[str, int] = {}
     companies: dict[str, dict] = {}
     results: list[dict] = []
@@ -572,6 +582,8 @@ def run_lookup(input_path: Path, out: Path | None, companies_out: Path | None) -
         d = clean_domain(r["domain"]) or ""
         m = by_key.get((r["gid_company"], d)) or {}
         c = m.get("company") or {}
+        if grizz_client.is_outside_plan(m):
+            outside += 1
         if m.get("matched") and c:
             hits += 1
             via[m.get("match_via") or "?"] = via.get(m.get("match_via") or "?", 0) + 1
@@ -579,19 +591,26 @@ def run_lookup(input_path: Path, out: Path | None, companies_out: Path | None) -
         results.append({
             "record_id": r["record_id"], "domain": r["domain"], "clean_domain": d,
             "matched": bool(m.get("matched")), "match_via": m.get("match_via"),
+            "outside_plan": grizz_client.is_outside_plan(m),
             "gid_company": c.get("gid_company"), "grizz_id": c.get("grizz_id"),
             "company_name": c.get("company_name"), "naics": c.get("naics"),
             "grizz_activity": c.get("grizz_activity"),
         })
 
-    misses = len(rows) - hits
+    misses = len(rows) - hits - outside
     table = Table(title="Grizz DB lookup", show_header=True, header_style="bold")
     table.add_column("Result")
     table.add_column("Rows", justify="right")
     table.add_column("%", justify="right")
     table.add_row("matched", str(hits), f"{100 * hits / len(rows):.1f}%")
+    if outside:
+        # In Grizz, outside the plan: enriching them won't return data, so don't suggest it.
+        table.add_row("outside your plan", str(outside), f"{100 * outside / len(rows):.1f}%")
     table.add_row("no match", str(misses), f"{100 * misses / len(rows):.1f}%")
     console.print(table)
+    if outside:
+        console.print("[magenta]Companies outside your plan are in Grizz; enriching them returns no data. "
+                      "Contact Grizz to expand your plan.[/magenta]")
     console.print(f"Distinct companies matched: {len(companies)}  |  "
                   f"match_via: {via or '—'}  |  {time.time() - t0:.0f}s")
 
@@ -615,8 +634,12 @@ def _companies_from_gids(api_key: str, gids: list[str]) -> list[dict]:
     that the downstream sync expects (hq_phone/hq_email -> phone/email)."""
     companies: list[dict] = []
     unmatched = 0
+    outside = 0
     for m in grizz_client.lookup_batch(api_key, [{"gid_company": g} for g in gids]):
         company = m.get("company")
+        if grizz_client.is_outside_plan(m):
+            outside += 1
+            continue
         if not m.get("matched") or not company:
             unmatched += 1
             continue
@@ -626,6 +649,9 @@ def _companies_from_gids(api_key: str, gids: list[str]) -> list[dict]:
         companies.append(c)
     if unmatched:
         console.print(f"  [yellow]{unmatched} compan(ies) returned no data — skipped.[/yellow]")
+    if outside:
+        console.print(f"  [magenta]{outside} compan(ies) are outside your plan — skipped "
+                      f"(no data written). Contact Grizz to expand your plan.[/magenta]")
     return companies
 
 
@@ -706,9 +732,11 @@ def run_write(
         seen_ids.add(rid)
         writable.append(r)
 
+    outside_n = sum(1 for r in results if not r.get("matched") and r.get("outside_plan"))
     console.print(f"Read [bold]{len(results)}[/bold] lookup result(s): "
                   f"[green]{len(hits)} matched[/green], "
-                  f"{len(results) - len(hits)} no match.")
+                  + (f"[magenta]{outside_n} outside your plan[/magenta] (not written), " if outside_n else "")
+                  + f"{len(results) - len(hits) - outside_n} no match.")
     if no_id:
         console.print(
             f"  [yellow]{len(no_id)} matched row(s) carry no record_id and cannot be "
@@ -1193,14 +1221,17 @@ def _read_discovery_rows(path: Path) -> list[dict]:
     return rows
 
 
-def _resolve_gids(api_key: str, rows: list[dict]) -> tuple[int, list[dict]]:
+def _resolve_gids(api_key: str, rows: list[dict]) -> tuple[int, list[dict], list[dict]]:
     """Fill gid_company for rows that only have a domain, via a free cascade
     lookup — so every company keys on a Grizz company and round-trips cleanly
     (this also collapses franchise/redirect domains onto the canonical company).
-    Mutates rows in place; returns (resolved_count, still_unresolved_rows)."""
+    Mutates rows in place; returns (resolved_count, still_unresolved_rows,
+    outside_plan_rows). Outside-plan rows are in Grizz but outside the caller's
+    plan: the lookup returns no company for them, but their people can still be
+    discovered, by domain."""
     need = [r for r in rows if not r["gid_company"] and r["domain"]]
     if not need:
-        return 0, []
+        return 0, [], []
     resolved = 0
     # Key both sides on the CLEANED domain: the client normalizes before sending,
     # so the echoed `input.domain` is clean while `r["domain"]` is the raw CSV
@@ -1213,8 +1244,13 @@ def _resolve_gids(api_key: str, rows: list[dict]) -> tuple[int, list[dict]]:
         d = clean_domain(((m or {}).get("input") or {}).get("domain"))
         if d:
             by_domain[d] = m
+    outside: list[dict] = []
     for r in need:
-        comp = (by_domain.get(clean_domain(r["domain"]) or "") or {}).get("company") or {}
+        m = by_domain.get(clean_domain(r["domain"]) or "") or {}
+        if grizz_client.is_outside_plan(m):
+            outside.append(r)
+            continue
+        comp = m.get("company") or {}
         gid = comp.get("gid_company")
         if gid:
             r["gid_company"] = gid
@@ -1223,7 +1259,8 @@ def _resolve_gids(api_key: str, rows: list[dict]) -> tuple[int, list[dict]]:
             if not r["domain_source"]:
                 r["domain_source"] = "grizz"
             resolved += 1
-    return resolved, [r for r in need if not r["gid_company"]]
+    out_ids = {id(r) for r in outside}
+    return resolved, [r for r in need if not r["gid_company"] and id(r) not in out_ids], outside
 
 
 def _fetch_all_members(api_key: str, audience_id: str, per_page: int = 200) -> list[dict]:
@@ -1265,9 +1302,12 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
     rows = _read_discovery_rows(input_file)
     console.print(f"Loaded [bold]{len(rows)}[/bold] company row(s) from {input_file}.")
 
-    resolved, unresolved = _resolve_gids(api_key, rows)
+    resolved, unresolved, outside = _resolve_gids(api_key, rows)
     if resolved:
         console.print(f"Resolved [bold]{resolved}[/bold] domain-only row(s) to a Grizz company.")
+    if outside:
+        console.print(f"[magenta]{len(outside)} row(s) are outside your plan[/magenta] — their company "
+                      f"data isn't included, but their people are still discovered (by domain).")
     if unresolved:
         console.print(f"[yellow]{len(unresolved)} row(s) have no gid and no resolvable domain — "
                       f"recorded as checked with 0 contacts.[/yellow]")
@@ -1277,6 +1317,11 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
     for r in rows:
         if r["gid_company"]:
             by_gid.setdefault(r["gid_company"], []).append(r)
+    # outside-plan rows: discovered by domain, members mapped back by employer domain
+    by_out_domain: dict[str, list[dict]] = {}
+    for r in outside:
+        by_out_domain.setdefault(clean_domain(r["domain"]) or "", []).append(r)
+    by_out_domain.pop("", None)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     contacts_path = out_dir / "contacts.json"
@@ -1292,21 +1337,28 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
             contacts = json.loads(contacts_path.read_text())
         console.print(f"[cyan]Resuming — {len(done_gids)} compan(ies) already discovered.[/cyan]")
 
-    remaining = [g for g in by_gid if g not in done_gids]
-    console.print(f"Discovering contacts for [bold]{len(remaining)}[/bold] compan(ies) "
+    # Work items: ("gid", gid) for Grizz-resolved companies, ("domain", d) for
+    # outside-plan ones. Done domains are kept in the same resume state, prefixed.
+    work = [("gid", g) for g in by_gid if g not in done_gids]
+    work += [("domain", d) for d in by_out_domain if f"domain:{d}" not in done_gids]
+    queues = [[k for kind, k in work if kind == "gid"], [k for kind, k in work if kind == "domain"]]
+    console.print(f"Discovering contacts for [bold]{len(work)}[/bold] compan(ies) "
                   f"in batches of {batch_size}.\n")
 
     unmapped = 0
     failed_batches = 0
-    total_batches = (len(remaining) + batch_size - 1) // batch_size
-    for bi in range(0, len(remaining), batch_size):
-        batch = remaining[bi:bi + batch_size]
-        n = bi // batch_size + 1
+    total_batches = (len(queues[0]) + batch_size - 1) // batch_size + len(queues[1])
+    batches = [("gid", q[i:i + batch_size]) for q in queues[:1] for i in range(0, len(q), batch_size)]
+    # Outside-plan domains go one per audience: their people come back under the
+    # company's own domain, which may differ from the input (an alias or redirect),
+    # so the only safe join back to the input row is "the one company in this batch".
+    batches += [("domain", [d]) for q in queues[1:] for d in q]
+    for n, (kind, batch) in enumerate(batches, 1):
         console.print(f"[{n}/{total_batches}] audience for {len(batch)} compan(ies)...", end=" ")
         try:
             aud = grizz_client.create_people_audience(
-                api_key, prompt=prompt, company_gids=batch,
-                max_per_company=max_per_company)
+                api_key, prompt=prompt, max_per_company=max_per_company,
+                **({"company_gids": batch} if kind == "gid" else {"domains": batch}))
         except Exception as e:
             console.print(f"[red]create failed: {e}[/red]")
             failed_batches += 1
@@ -1330,7 +1382,10 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
 
         batch_contacts = 0
         for m in _fetch_all_members(api_key, aid):
-            owners = by_gid.get(m.get("company_gid"))
+            if kind == "gid":
+                owners = by_gid.get(m.get("company_gid"))
+            else:
+                owners = by_out_domain.get(batch[0])  # one company per batch: it's theirs
             if not owners:
                 unmapped += 1
                 continue
@@ -1343,18 +1398,20 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
             contacts.append(row)
             batch_contacts += 1
 
-        done_gids.update(batch)
+        done_gids.update(batch if kind == "gid" else [f"domain:{d}" for d in batch])
         console.print(f"[green]COMPLETE[/green] — {batch_contacts} contact(s).")
         # persist after every batch so the run is crash-safe / resumable
         contacts_path.write_text(json.dumps(contacts, indent=2))
         state_path.write_text(json.dumps({"done_gids": sorted(done_gids)}, indent=2))
 
+    outside_ids = {id(o) for o in outside}
     # checked.json — one roster row per input company (found or not)
     checked = [{
         "record_id": r["record_id"],
         "company_name": r["name"],
         "domain_used": r["domain"],
         "domain_source": r["domain_source"] or ("grizz" if r["gid_company"] else ""),
+        **({"outside_plan": True} if id(r) in outside_ids else {}),
     } for r in rows]
     checked_path.write_text(json.dumps(checked, indent=2))
     _write_discovery_csv(csv_path, contacts)
@@ -2033,10 +2090,13 @@ def enrich(
     crm: str = typer.Option(..., help=f"CRM to use. Available: {', '.join(ADAPTERS)}"),
     input: Path = typer.Option(..., help="CSV file containing account IDs (requires an 'Id' column)"),
     config: Path = typer.Option(Path("config.yaml"), help="Path to your config.yaml"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without updating the CRM"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview CRM changes without writing them. Still runs the Grizz enrichment for each account, and each accepted one counts as an enrichment call."),
     concurrency: int = typer.Option(12, "--concurrency", help="Parallel enrich+write workers (these CRMs have no batch-write API, so throughput comes from concurrency). Ignored in --dry-run."),
 ):
-    """Enrich CRM accounts from a CSV of account IDs using the Grizz API."""
+    """Enrich CRM accounts from a CSV of account IDs using the Grizz API.
+
+    Each account Grizz accepts counts as one enrichment call, including accounts
+    whose company is outside your plan (reported as `outside_plan`, nothing written)."""
     if crm not in ADAPTERS:
         console.print(f"[red]Unknown CRM '{crm}'. Available: {', '.join(ADAPTERS)}[/red]")
         raise typer.Exit(1)

@@ -219,6 +219,8 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
           "company":   {gid_company, domain, company_name, naics,
                          employee_range, ...} | null
         }
+    A company outside the caller's plan comes back with `matched: false`,
+    `company: null` and `reason: "outside_plan"` (see `is_outside_plan`).
     """
     url = f"{BASE_URL}/api/v1/companies/lookup-batch/"
     matches: list[dict] = []
@@ -662,23 +664,28 @@ def fetch_results(api_key: str, request_id: str) -> dict:
     return resp.json()
 
 
-def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) -> dict | None:
-    """Run the full submit → poll → fetch cycle for a single company.
+OUTSIDE_PLAN = "outside_plan"
 
-    Accepts any of the cascade-input keys (see the Grizz API docs):
-        gid_company, grizz_id, domain, company_name,
-        hq_city, hq_state, hq_country, hq_phone
 
-    `domain` may still be passed positionally; pure-domain callers are
-    unchanged.
+def is_outside_plan(payload: dict | None) -> bool:
+    """True if a Grizz result says the company is outside the caller's plan.
 
-    Returns:
-        Results dict on success, None if Grizz returns no_match.
+    Orgs on a plan that covers part of Grizz get, for a company outside it, the
+    normal result shape with no company data and `reason: "outside_plan"`
+    (`result_type: "OUTSIDE_PLAN"` on enrich requests). That is not a miss: the
+    company exists, it just isn't in the plan, so don't re-enrich it.
+    """
+    p = payload or {}
+    return (p.get("reason") == OUTSIDE_PLAN or p.get("result_type") == "OUTSIDE_PLAN"
+            or p.get("status") == OUTSIDE_PLAN)
 
-    Raises:
-        RuntimeError:  If the request fails.
-        TimeoutError:  If polling exceeds MAX_POLLS.
-        requests.HTTPError: On API errors.
+
+def enrich_detailed(api_key: str, domain: str | None = None, on_status=None, **kwargs) -> dict:
+    """Like `enrich`, but says *why* there's no company.
+
+    Returns {"company": dict | None, "outside_plan": bool, "plan": str | None,
+             "request_id": str}.
+    Each call counts as one enrichment call, outside_plan results included.
     """
     data = submit(api_key, domain=domain, **kwargs)
     request_id = data["id"]
@@ -703,11 +710,78 @@ def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) ->
         )
 
     results = fetch_results(api_key, request_id)
+    outside = is_outside_plan(results) or is_outside_plan(data)
+    return {"company": None if outside else (results.get("company") or None),
+            "outside_plan": outside, "plan": results.get("plan") if outside else None,
+            "request_id": request_id}
 
-    # One canonical company shape for every result; `company` is null when the
-    # domain wasn't found. Key off its presence rather than a status label so the
-    # client doesn't depend on the exact wording of the result status.
-    return results.get("company") or None
+
+def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) -> dict | None:
+    """Run the full submit → poll → fetch cycle for a single company.
+
+    Accepts any of the cascade-input keys (see the Grizz API docs):
+        gid_company, grizz_id, domain, company_name,
+        hq_city, hq_state, hq_country, hq_phone
+
+    `domain` may still be passed positionally; pure-domain callers are
+    unchanged.
+
+    Returns:
+        Results dict on success, None if there's no company data: not found, or
+        outside the caller's plan (use `enrich_detailed` to tell them apart).
+
+    Raises:
+        RuntimeError:  If the request fails.
+        TimeoutError:  If polling exceeds MAX_POLLS.
+        requests.HTTPError: On API errors.
+    """
+    return enrich_detailed(api_key, domain=domain, on_status=on_status, **kwargs)["company"]
+
+
+def _echo_key(d: dict) -> tuple:
+    """The identity a bulk result echoes back, from either an input dict or a result row."""
+    from grizz_enrichment.domain_utils import clean_domain
+    get = lambda *ks: next((d.get(k) for k in ks if d.get(k)), "") or ""
+    return (clean_domain(get("input_domain", "domain")) or "",
+            str(get("input_grizz_id", "gid_company", "grizz_id")).strip(),
+            str(get("input_company_name", "company_name")).strip().lower())
+
+
+def _pair_by_echo(inputs: list[dict], results: list[dict]) -> tuple[list[tuple[dict, dict]], list[dict]]:
+    """Pair each bulk result with the input it echoes. Returns (pairs, unpaired_results).
+
+    Passes, in priority order: exact cleaned domain, then Grizz id, then company
+    name only when exactly one remaining input has that name (branches and
+    franchises share names). Inputs with nothing to echo (the server rejects
+    them, so they have no result) never take part. There is no positional
+    fallback: a result that matches no input is returned unpaired rather than
+    guessed onto the wrong record.
+    """
+    keys = [_echo_key(_cascade_payload(i) if isinstance(i, dict) else {"domain": i}) for i in inputs]
+    remaining = [i for i, k in enumerate(keys) if any(k)]
+    pairs: list[tuple[dict, dict]] = []
+    pending = list(results)
+    for field in range(3):
+        still: list[dict] = []
+        for res in pending:
+            value = _echo_key(res)[field]
+            cands = [i for i in remaining if value and keys[i][field] == value] if value else []
+            if len(cands) > 1:
+                # several inputs share this key: narrow by the full echo; take the first
+                # only when the remaining candidates are indistinguishable
+                full = _echo_key(res)
+                exact = [i for i in cands if keys[i] == full]
+                cands = exact if exact else cands
+                if len({keys[i] for i in cands}) > 1:
+                    cands = []
+            if cands and (len(cands) == 1 or field < 2):
+                hit = cands[0]
+                remaining.remove(hit)
+                pairs.append((inputs[hit], res))
+            else:
+                still.append(res)
+        pending = still
+    return pairs, pending
 
 
 def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
@@ -715,12 +789,15 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
 
     Submits via POST /api/v1/companies/enrich-bulk/, polls each PENDING request
     until COMPLETE/FAILED, then fetches results.  Each matched/no_match/
-    low_conf/failed entry carries its `input` dict so callers can map
-    results back to the input cohort.
+    outside_plan/low_conf/failed entry carries its `input` dict so callers can
+    map results back to the input cohort.  Results are paired with inputs by the
+    input values the API echoes back (not by position), so a skipped or
+    reordered slot can't shift every later result onto the wrong company.
 
         {
           "matched":     [{"input": {...}, "company": {...}, "request_id": "..."}],
           "no_match":    [{"input": {...}, "request_id": "..."}],
+          "outside_plan":[{"input": {...}, "request_id": "..."}],   # in Grizz, not in your plan
           "low_conf":    [{"input": {...}, "request_id": "..."}],
           "failed":      [{"input": {...}, "request_id": "...", "error": "..."}],
           "rejected":    [...],                 # passed through from bulk endpoint
@@ -735,12 +812,15 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
 
     matched: list[dict]  = []
     no_match: list[dict] = []
+    outside_plan: list[dict] = []
     low_conf: list[dict] = []
     failed: list[dict]   = []
 
-    # Align each returned EnrichmentRequest with its original input dict
-    # by position — the bulk endpoint preserves order for `results`.
-    for raw_input, req in zip(companies, initial_requests):
+    pairs, unpaired = _pair_by_echo(companies, initial_requests)
+    for req in unpaired:  # never guessed onto an input by position
+        failed.append({"input": {}, "request_id": req.get("id"),
+                       "error": "result could not be paired with an input"})
+    for raw_input, req in pairs:
         request_id = req.get("id")
         st = req.get("status")
         polls = 0
@@ -759,6 +839,9 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
                            "error": f"timeout after {polls} polls"})
             continue
 
+        if is_outside_plan(req):
+            outside_plan.append({"input": raw_input, "request_id": request_id})
+            continue
         if req.get("result_type") == "NOT_FOUND":
             no_match.append({"input": raw_input, "request_id": request_id})
             continue
@@ -767,6 +850,9 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
             continue
 
         results = fetch_results(api_key, request_id)
+        if is_outside_plan(results):
+            outside_plan.append({"input": raw_input, "request_id": request_id})
+            continue
         company = results.get("company")
         if not company:
             no_match.append({"input": raw_input, "request_id": request_id})
@@ -777,6 +863,7 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
     return {
         "matched":  matched,
         "no_match": no_match,
+        "outside_plan": outside_plan,
         "low_conf": low_conf,
         "failed":   failed,
         "rejected": body.get("rejected") or [],
