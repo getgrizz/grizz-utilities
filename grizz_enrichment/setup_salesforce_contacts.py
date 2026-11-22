@@ -1,7 +1,7 @@
 """Create all recommended Grizz custom fields on the Salesforce Contact object.
 
-Kept in lock-step with the MCP's grizz_enrichment/setup_salesforce_contacts.py so
-CLI setup and the `setup_crm_contacts` MCP tool provision the SAME fields.
+Contact sync writes exactly these fields, so they must exist before the first
+`people sync`.
 """
 
 import os
@@ -180,7 +180,7 @@ def _set_fls(sf, full_name: str, pset_id: str) -> None:
         })
 
 
-def run_setup(dry_run: bool = False) -> None:
+def run_setup(dry_run: bool = False) -> dict:
     """Connect to Salesforce and create all Grizz custom fields on Contact."""
 
     # ── Connect ──────────────────────────────────────────────────────────────
@@ -200,10 +200,10 @@ def run_setup(dry_run: bool = False) -> None:
             )
     except KeyError as e:
         console.print(f"\n[red]Missing environment variable: {e}[/red]")
-        return
+        return {"errors": ["could not connect"]}
     except Exception as e:
         console.print(f"\n[red]Connection failed: {e}[/red]")
-        return
+        return {"errors": ["could not connect"]}
     console.print("[green]connected.[/green]")
 
     if dry_run:
@@ -288,3 +288,4 @@ def run_setup(dry_run: bool = False) -> None:
         "Setup → Object Manager → Contact → Page Layouts, "
         "edit your layout, and drag the Grizz fields into a new section.[/dim]"
     )
+    return {"errors": [f"{errors} field(s) failed"] if errors else []}

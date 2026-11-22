@@ -9,6 +9,27 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **HubSpot and Salesforce contact sync is now client-side.** `people sync --crm
+  hubspot|salesforce` writes from this machine with your own credentials, the same
+  model as companies and Attio. Your CRM credentials are never sent to Grizz. The
+  CLI reads each account's existing contacts, gets a write plan from Grizz
+  (`prepare-writes`), and writes only what the plan says: Grizz fields on existing
+  contacts, plus native name/email/phone/title on new ones, linked to the account.
+  Created contacts are paired to their inputs by Grizz person id, never by
+  position. Contacts whose company isn't in the CRM yet are skipped
+  (`no_parent_match`), never created unlinked. Older CLI versions get a "retired"
+  error from the old contact endpoint: `git pull` to upgrade.
+- **`enrich` is gentler on the API.** Default concurrency is 4, and the run stops
+  at the first server error, timeout or exhausted rate limit; unfinished accounts
+  are written to `<input>_rerun.csv` for the re-run.
+- **`setup` records itself with Grizz.** After a successful setup, the org's field
+  mappings are seeded and marked synced, so the dashboard's setup to-dos close.
+
+### Removed
+- The client wrappers for the retired server-side CRM endpoints (get/update/create
+  CRM records, tech-gap, persona-gap, write-request polling).
+
 ### Fixed
 - **`write` / `audience` dropped HQ location and NAICS from enrich payloads.**
   `_grizz_data` read only the lookup/audience keys (`hq_city`, `hq_region`,
@@ -270,7 +291,7 @@ This project uses [Semantic Versioning](https://semver.org/).
 - Attio adapter now stamps `grizz_last_sync` on every write. It was dropped in the
   headless→adapter conversion, so freshness/coverage counts never moved even though
   the data synced.
-- Attio matching is now driven by `gid_company` (the canonical id, api.md §10),
+- Attio matching is now driven by `gid_company` (the canonical id),
   with a native `domains` fallback for records that don't carry a gid yet — fixing
   both the wrong driving key and the duplicate-creation risk for pre-gid records.
 - A 429 `Retry-After` returned as an HTTP-date (Attio's form) no longer crashes

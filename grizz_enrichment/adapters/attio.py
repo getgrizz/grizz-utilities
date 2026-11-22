@@ -28,7 +28,7 @@ import requests
 from .base import CRMAdapter
 
 _BASE_URL = "https://api.attio.com"
-_GID_SLUG = "grizz_gid"              # gid_company — the canonical driving id (api.md §10)
+_GID_SLUG = "grizz_gid"              # gid_company — the canonical driving id
 _LAST_SYNC_SLUG = "grizz_last_sync"  # stamped (now) on every write so freshness tracks
 _QUERY_BATCH = 100   # values per $in query
 _QUERY_PAGE = 500    # records per query page
@@ -351,7 +351,7 @@ class AttioAdapter(_AttioBase, CRMAdapter):
 
     def find_accounts_bulk(self, companies: list[dict], grizz_id_field: str) -> dict[str, str]:
         """Match companies to Attio records, DRIVEN BY gid_company (grizz_gid — the
-        canonical id, api.md §10), then falling back to the native `domains`
+        canonical id), then falling back to the native `domains`
         attribute for records that don't carry a gid yet (e.g. created before gids
         existed; the domain fallback prevents duplicates, and our write stamps the
         gid so they match directly next time).

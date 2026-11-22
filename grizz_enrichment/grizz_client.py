@@ -200,8 +200,7 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
     structured view per input.  No EnrichmentRequest rows are created and
     no credits are charged.
 
-    Used internally by orchestrator endpoints (tech-gap, create-crm) and by
-    `run.py lookup` / `_resolve_gids`.
+    Used by `run.py lookup` / `_resolve_gids`.
 
     Inputs over the endpoint's 5000 cap are chunked automatically and the
     results concatenated, so callers never chunk themselves.  Transient 429/5xx
@@ -249,167 +248,22 @@ def setup_instructions(api_key: str, crm: str = "attio") -> dict:
     return resp.json()
 
 
-def tech_gap(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    field_mapping: dict | None = None,
-    limit: int = 500,
-) -> dict:
-    """Pair of `get_tech_gap_companies` MCP tool — the combined tech-gap
-    list, both halves (in_crm + not_in_crm) in one call.
-
-    Server-side orchestration: pulls customer's CRM accounts, queries
-    Grizz universe in ICP scope, composes per-record presence + status.
-    Credentials live only in server worker memory for the request.
-
-    Returns the response body verbatim from
-    POST /api/v1/companies/tech-gap/:
-        {
-          "crm":              "salesforce",
-          "count":            int,
-          "in_crm_count":     int,
-          "not_in_crm_count": int,
-          "limit":            int,
-          "records":          [{crm_id, presence, gid_company, ..., status}]
-        }
-    """
-    payload: dict = {"crm": crm, "credentials": credentials, "limit": limit}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    url = f"{BASE_URL}/api/v1/companies/tech-gap/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
+def seed_field_mappings(api_key: str, crm: str, object_type: str) -> dict:
+    """Seed the org's Grizz field mappings for a CRM object (idempotent: only
+    canonical fields the org doesn't have yet are added)."""
+    resp = requests.post(f"{BASE_URL}/api/v1/admin/crm-field-mappings/seed/",
+                         json={"crm": crm, "object_type": object_type},
+                         headers=_headers(api_key), timeout=60)
     _raise_with_body(resp)
     return resp.json()
 
 
-def get_crm(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    filter: str = "stale",
-    field_mapping: dict | None = None,
-    limit: int = 500,
-    stale_days: int = 60,
-) -> dict:
-    """Pair of the `get_crm_companies` MCP tool — paginated CRM detail rows
-    with per-account Grizz status.
-
-    Wraps POST /api/v1/companies/get-crm/.  Server-side: pulls the
-    customer's CRM, filters by Last Sync status (awaiting / stale / all),
-    joins Grizz's view via the cascade.  Returns the response body
-    verbatim: {crm, filter, count, limit, records}.
-    """
-    payload: dict = {"crm": crm, "credentials": credentials,
-                     "filter": filter, "limit": limit, "stale_days": stale_days}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    url = f"{BASE_URL}/api/v1/companies/get-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    _raise_with_body(resp)
-    return resp.json()
-
-
-def update_crm(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    records: list[dict],
-    field_mapping: dict | None = None,
-) -> dict:
-    """Pair of the `update_crm_companies` MCP tool — submit a CRM-account
-    update job and get back a request_id for polling.
-
-    Wraps POST /api/v1/companies/update-crm/.  The server queues the
-    work on Celery (the SF Account-table pagination that runs when
-    records lack crm_id alone can exceed the gunicorn worker timeout)
-    and returns 202 with `{request_id, status: "PENDING", total}`
-    immediately.  Poll `check_crm_write_request(request_id)` for the
-    final result.
-    """
-    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    url = f"{BASE_URL}/api/v1/companies/update-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
-    _raise_with_body(resp)
-    return resp.json()
-
-
-def persona_gap(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    field_mapping: dict | None = None,
-    limit: int = 500,
-) -> dict:
-    """Pair of the `get_persona_gap_contacts` MCP tool — the prospecting
-    list of ICP-persona contacts at the customer's CRM accounts that aren't
-    in their CRM yet.  Server-side: pulls accounts + contacts, queries
-    Grizz Persons matching the org's ICP personas at those accounts,
-    excludes any already represented.  Returns the body verbatim from
-    POST /api/v1/people/persona-gap/:
-        {crm, count, limit, icp_personas, records: [...]}.
-    Each record is ready to pass into create_crm_contacts.
-    """
-    payload: dict = {"crm": crm, "credentials": credentials, "limit": limit}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    url = f"{BASE_URL}/api/v1/people/persona-gap/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    _raise_with_body(resp)
-    return resp.json()
-
-
-def get_crm_contacts(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    filter: str = "all",
-    field_mapping: dict | None = None,
-    limit: int = 500,
-) -> dict:
-    """Pair of the `get_crm_contacts` MCP tool — paginated CRM contact rows
-    with the Grizz Contact view joined in.
-
-    Wraps POST /api/v1/people/get-crm/.  Server-side: pulls the customer's
-    CRM contacts, filters by `all` or `unmatched` (no Grizz dedup stamp),
-    joins Grizz's view via the cascade.  Returns the response body
-    verbatim: {crm, filter, count, limit, records}.
-    """
-    payload: dict = {"crm": crm, "credentials": credentials,
-                     "filter": filter, "limit": limit}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    url = f"{BASE_URL}/api/v1/people/get-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    _raise_with_body(resp)
-    return resp.json()
-
-
-def create_in_crm_contacts(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    records: list[dict],
-    field_mapping: dict | None = None,
-    native_field_mapping: dict | None = None,
-) -> dict:
-    """Pair of the `create_crm_contacts` MCP tool — submit a create job and
-    get back a request_id for polling.
-
-    Wraps POST /api/v1/people/create-crm/.  The server queues the work on
-    Celery (parent linking + creates can run for minutes on 50-100+ contacts)
-    and returns 202 with `{request_id, status: "PENDING", total}` immediately.
-    Poll `check_crm_write_request(request_id)` for the final result.
-    """
-    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    if native_field_mapping is not None:
-        payload["native_field_mapping"] = native_field_mapping
-    url = f"{BASE_URL}/api/v1/people/create-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=60)
+def mark_field_mappings_synced(api_key: str, crm: str, object_types: list[str]) -> dict:
+    """Record that setup created the mapped fields in the CRM, which closes the
+    dashboard's setup to-dos."""
+    resp = requests.post(f"{BASE_URL}/api/v1/admin/crm-field-mappings/mark-synced/",
+                         json={"crm": crm, "object_types": object_types},
+                         headers=_headers(api_key), timeout=60)
     _raise_with_body(resp)
     return resp.json()
 
@@ -421,12 +275,13 @@ def prepare_contact_writes(
     crm_contacts: list[dict],
     field_mapping: dict | None = None,
 ) -> dict:
-    """Headless, account-scoped contact MATCHING for Attio (POST
-    /api/v1/people/prepare-writes/).  Grizz performs NO CRM I/O — the caller
-    passes the parent account's existing CRM contacts (`crm_contacts`, read from
-    Attio) and Grizz runs the SAME dedup cascade the HubSpot/Salesforce server
-    path uses (grizz_person_id → email → linkedin → fuzzy name), returning per
-    input record whether it matches an existing contact.
+    """Headless, account-scoped contact write plan (POST
+    /api/v1/people/prepare-writes/) for attio, hubspot or salesforce.  Grizz
+    performs NO CRM I/O and never receives CRM credentials — the caller passes
+    the parent account's existing CRM contacts (`crm_contacts`, read with the
+    caller's own credentials) and Grizz runs the dedup cascade (grizz person id →
+    email → linkedin → fuzzy name), returning per input record whether it
+    matches an existing contact.
 
     `records`      — [{gid_person|primary_email|linkedin_url, first_name,
                        last_name, title, gid_company}], ≤200 per call.
@@ -435,31 +290,15 @@ def prepare_contact_writes(
                        linkedin_url, grizz_person_id}].
 
     Returns {crm, object, total, prepared, no_grizz_match, matched_existing,
-    new_contacts, records:[{matched, crm_match:{record_id, match_via,
-    confidence}|null, values, on_create_values, parent}]}.  `records` is 1:1 and
-    in order with the input `records`.  match_via "fuzzy" carries a confidence the
+    new_contacts, records:[{input_*, matched, crm_match:{record_id, match_via,
+    confidence}|null, values, on_create_values, parent}]}.  Pair rows to inputs
+    by the echoed `input_*` keys, not by position.  match_via "fuzzy" carries a confidence the
     caller should verify before merging (don't silently merge)."""
     payload: dict = {"crm": crm, "records": records, "crm_contacts": crm_contacts}
     if field_mapping is not None:
         payload["field_mapping"] = field_mapping
     url = f"{BASE_URL}/api/v1/people/prepare-writes/"
     resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=120)
-    _raise_with_body(resp)
-    return resp.json()
-
-
-def check_crm_write_request(api_key: str, request_id: str) -> dict:
-    """Pair of the `check_crm_write_request` MCP tool — poll a CRM write job.
-
-    Wraps GET /api/v1/crm-write-requests/<request_id>/.  Returns:
-      - {status: "PENDING" | "RUNNING", request_id, kind, crm, total}
-        while the job is still working.
-      - {status: "COMPLETE", ..., results: [...], created, no_grizz_match,
-        no_parent_match, parent_linked, errors} when done.
-      - {status: "FAILED", error_message} on failure.
-    """
-    url = f"{BASE_URL}/api/v1/crm-write-requests/{request_id}/"
-    resp = requests.get(url, headers=_headers(api_key), timeout=30)
     _raise_with_body(resp)
     return resp.json()
 
@@ -589,61 +428,6 @@ def get_people_audience_members(
     url = f"{BASE_URL}/api/v1/people/audiences/{audience_id}/members/"
     resp = requests.get(url, params={"page": page, "per_page": per_page},
                         headers=_headers(api_key), timeout=60)
-    _raise_with_body(resp)
-    return resp.json()
-
-
-def update_crm_contacts(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    records: list[dict],
-    field_mapping: dict | None = None,
-) -> dict:
-    """Pair of the `update_crm_contacts` MCP tool — rewrite Grizz_Contact_*
-    fields on existing CRM contacts.
-
-    Wraps POST /api/v1/people/update-crm/.  Server-side: looks up Grizz's view
-    per record, rewrites every Grizz_Contact_* field, leaves native columns
-    (FirstName, LastName, Email, Phone, Title, Mailing*) untouched.  Each
-    record needs `crm_id`; records without it come back as no_crm_match.
-    """
-    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    url = f"{BASE_URL}/api/v1/people/update-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
-    _raise_with_body(resp)
-    return resp.json()
-
-
-def create_in_crm(
-    api_key: str,
-    crm: str,
-    credentials: dict,
-    records: list[dict],
-    field_mapping: dict | None = None,
-    native_field_mapping: dict | None = None,
-) -> dict:
-    """Pair of `create_crm_companies` MCP tool — universal Step 4 of the
-    company-resolution flow.
-
-    Server-side orchestration: for each input record, looks up Grizz's
-    view via the cascade, builds a CRM create payload from every Grizz_*
-    field, and POSTs to the customer's CRM (Salesforce composite/sobjects
-    or HubSpot batch/create).  Returns per-record outcome with new crm_ids.
-
-    Up to 5000 records per call; credentials live only in server worker
-    memory.  Returns the response body verbatim from
-    POST /api/v1/companies/create-crm/.
-    """
-    payload: dict = {"crm": crm, "credentials": credentials, "records": records}
-    if field_mapping is not None:
-        payload["field_mapping"] = field_mapping
-    if native_field_mapping is not None:
-        payload["native_field_mapping"] = native_field_mapping
-    url = f"{BASE_URL}/api/v1/companies/create-crm/"
-    resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=600)
     _raise_with_body(resp)
     return resp.json()
 

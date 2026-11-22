@@ -197,7 +197,7 @@ attio:
 
 # ── Attio — People (contacts) ─────────────────────────────────────────────────
 # Used by `python run.py people sync --crm attio` — the client-side contact sync
-# (Attio is headless; there is no server-side contact endpoint).  Run
+# (every CRM syncs client-side, with your own credentials).  Run
 # `python run.py setup --crm attio --object contacts` to create the grizz_contact_*
 # attributes below (setup reads THIS section, so it only creates what you map —
 # it never touches your Companies object).

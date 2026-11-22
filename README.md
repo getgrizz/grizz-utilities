@@ -364,6 +364,8 @@ The integration uses a **Legacy App access token**. Here's how to create one:
    - `crm.objects.companies.write`
    - `crm.schemas.companies.read`
    - `crm.schemas.companies.write`
+   - `crm.objects.contacts.read`, `crm.objects.contacts.write`,
+     `crm.schemas.contacts.read`, `crm.schemas.contacts.write` (for contact sync)
 6. Save the app
 7. Copy the **Access token** from the app detail page
 8. Add it to your `.env` as `HUBSPOT_API_KEY`
@@ -378,6 +380,29 @@ The integration uses a **Legacy App access token**. Here's how to create one:
   4. On Enterprise, set a default layout for all users at: *Settings → Data Management → Record Customization*
 
 ---
+
+## Contacts (HubSpot / Salesforce)
+
+Contacts sync client-side, like companies: your credentials stay in `.env` on
+this machine and are never sent to Grizz. Grizz returns a write plan; the CLI
+writes it.
+
+```bash
+python run.py setup --crm hubspot --object contacts      # once: the grizz_contact_* properties
+python run.py people discover --input companies.csv --out-dir people_out
+python run.py people sync --crm hubspot --contacts people_out/contacts.json --dry-run
+python run.py people sync --crm hubspot --contacts people_out/contacts.json --enrich-email
+```
+
+Each contact is matched against its account's existing contacts (Grizz person id
+→ email → LinkedIn → name). Matches are updated with Grizz fields only. New
+contacts are created with their name, email, phone and title, and linked to the
+account. A contact whose company isn't in your CRM yet is skipped and counted as
+`no_parent_match`: sync the companies first (`run.py audience` or `run.py write`),
+then re-run. A contact that already carries its Grizz person id anywhere in the CRM
+is updated, not created again. Fuzzy name matches below `--fuzzy-threshold` are listed for review, never
+merged. In HubSpot, a contact whose email already exists anywhere in the portal is
+updated rather than duplicated.
 
 ## Attio
 
@@ -432,8 +457,8 @@ canonical `grizz_*` slugs — **edit it to match whatever you named your attribu
 (setup and sync both read these slugs, so if you built `grizz_hq_phone` rather than
 `grizz_phone`, point the mapping there and setup will see it already exists).
 
-**3. Sync contacts (People)** — Attio is headless, so contacts sync **client-side**,
-the same model as companies (there is no server-side Attio contact endpoint):
+**3. Sync contacts (People)** — contacts sync **client-side**, the same model as
+companies, with your own Attio key:
 
 ```bash
 python run.py setup   --crm attio --object contacts     # create the People grizz_contact_* attributes
@@ -444,9 +469,9 @@ python run.py people sync --crm attio --contacts people_out/contacts.json --enri
 The `attio_contacts:` section of `config.yaml` maps person fields to your Attio
 People attributes. Deduplication reuses the **same cascade as HubSpot/Salesforce**:
 a global strong-key match (grizz_person_id, email) plus an **account-scoped**
-`grizz_person_id → email → linkedin → fuzzy-name` match run server-side (the client
-reads each parent company's existing people and passes them to Grizz's
-`prepare-writes` endpoint, so the matching logic lives in one place). Matching is
+`grizz_person_id → email → linkedin → fuzzy-name` match: the CLI reads each parent
+company's existing people and sends them to Grizz's `prepare-writes` endpoint,
+which returns the write plan, so the matching logic lives in one place. Matching is
 scoped to the parent company, so two people with the same name at different
 companies never collide; fuzzy name matches below `--fuzzy-threshold` (default 0.9)
 are surfaced for review rather than merged. Following the Grizz write principle, it

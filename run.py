@@ -14,6 +14,7 @@ import csv
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 import questionary
+import requests
 import typer
 import yaml
 from dotenv import load_dotenv
@@ -96,7 +98,7 @@ def read_account_ids(input_file: Path) -> list[str]:
 # ── Core enrichment logic ──────────────────────────────────────────────────────
 
 def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
-               concurrency: int = 12) -> None:
+               concurrency: int = 4) -> None:
     """Fetch domains from CRM, enrich via Grizz, write results back."""
 
     # ── Config ──────────────────────────────────────────────────────────────
@@ -152,21 +154,34 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
     total = len(account_ids)
     sync_ts = _sync_timestamp()
 
+    halt = threading.Event()   # set on the first Grizz 5xx: stop, don't hammer the API
+
     def _process(account_id: str) -> tuple[str, str, str]:
         """Enrich one account end-to-end (get domain → Grizz → write).
         Returns (account_id, outcome, detail); isolates its own errors so a
-        single bad record never aborts the pool."""
+        single bad record never aborts the pool, except a Grizz server error,
+        which stops the run."""
+        if halt.is_set():
+            return (account_id, "not_run", "stopped after a Grizz server error")
         try:
             domain = adapter.get_domain(account_id, domain_field)
         except Exception as e:
             return (account_id, "error", str(e))
         if not domain:
             return (account_id, "skipped", "no domain")
+        if halt.is_set():
+            return (account_id, "not_run", "stopped after a Grizz server error")
         try:
             # No per-poll on_status spinner — interleaved \r writes are unreadable
             # across threads.
             res = grizz_client.enrich_detailed(grizz_api_key, domain)
         except Exception as e:
+            # The client already retried; a 5xx, a still-failing 429, or a
+            # timeout / dropped connection means the API is struggling: stop.
+            status = getattr(getattr(e, "response", None), "status_code", 0) or 0
+            if status >= 500 or status == 429 or isinstance(
+                    e, (requests.Timeout, requests.ConnectionError)):
+                halt.set()
             return (account_id, "error", str(e))
         if res["outside_plan"]:
             # In Grizz, but not in this account's plan: nothing to write, don't re-enrich it.
@@ -222,6 +237,7 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         "no_updates": "yellow",
         "outside_plan": "magenta",
         "error": "red",
+        "not_run": "red",
     }
 
     for account_id, outcome, detail in summary:
@@ -229,6 +245,13 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         table.add_row(account_id, f"[{color}]{outcome}[/{color}]", detail)
 
     console.print(table)
+    if halt.is_set():
+        todo = [aid for aid, o, _ in summary if o in ("not_run", "error")]
+        rerun = input_file.with_name(input_file.stem + "_rerun.csv")
+        rerun.write_text("Id\n" + "".join(f"{a}\n" for a in todo), encoding="utf-8")
+        console.print(f"[red]Stopped at the first Grizz server error.[/red] The {len(todo)} "
+                      f"account(s) not finished are in [bold]{rerun}[/bold]. Re-run later with "
+                      f"`--input {rerun}` so finished accounts aren't enriched again.")
 
     success_count = sum(1 for _, o, _ in summary if o in ("success", "dry_run"))
     console.print(
@@ -1470,29 +1493,6 @@ def people_discover(
 
 # ── People sync (enrich + push contacts to CRM) ─────────────────────────────────
 
-def _crm_contact_credentials(crm: str) -> dict:
-    """Gather the customer-CRM credentials the server-side contact endpoints
-    expect (they ride in the request body, not the auth header — that's the
-    Grizz API key).  Sourced from the same env vars the CRM adapters use."""
-    if crm == "hubspot":
-        token = os.environ.get("HUBSPOT_API_KEY")
-        if not token:
-            console.print("[red]HUBSPOT_API_KEY is not set.[/red] "
-                          "Add your HubSpot private-app token to [bold].env[/bold].")
-            raise typer.Exit(1)
-        return {"hubspot_key": token}
-    if crm == "salesforce":
-        inst = os.environ.get("SALESFORCE_INSTANCE_URL")
-        sess = os.environ.get("SALESFORCE_SESSION_ID")
-        if not (inst and sess):
-            console.print("[red]SALESFORCE_INSTANCE_URL and SALESFORCE_SESSION_ID must be set "
-                          "in [bold].env[/bold] for contact sync.[/red]")
-            raise typer.Exit(1)
-        return {"sf_instance_url": inst, "sf_session_id": sess}
-    console.print(f"[red]Contact sync is not supported for CRM '{crm}'.[/red]")
-    raise typer.Exit(1)
-
-
 def _read_person_gids(path: Path) -> list[str]:
     """Read Grizz person gids from a `people discover` contacts.json, a CSV with
     a gid/gid_person column, or a plain one-gid-per-line file."""
@@ -1600,68 +1600,209 @@ def _run_enrich(api_key: str, gids: list[str], enrich_email: bool, enrich_phone:
             "are not re-charged. Proceeding to push whatever is entitled so far.")
 
 
-def run_people_sync(crm: str, contacts_path: Path, enrich_email: bool, enrich_phone: bool,
-                    enrich_batch_size: int, poll_interval: int, poll_timeout: int,
-                    dry_run: bool) -> None:
-    """Enrich (optional) + push discovered contacts to the CRM via the same
-    server-side create-crm endpoint the MCP uses — which matches each contact
-    against its parent account's existing CRM contacts and UPDATES in place
-    rather than duplicating (create-or-update)."""
+_DEFAULT_GID_FIELD = {"hubspot": "grizz_gid", "salesforce": "Grizz_GID__c"}
+
+
+def _plan_rows_by_gid(rows: list[dict], gids: list[str]) -> dict[str, dict]:
+    """Pair write-plan rows to inputs by the echoed `input_gid_person`, never by
+    position.  A gid the plan doesn't echo exactly once is left out, and the
+    caller reports it as unpaired."""
+    seen: dict[str, list[dict]] = {}
+    for r in rows:
+        g = str(r.get("input_gid_person") or "")
+        if g:
+            seen.setdefault(g, []).append(r)
+    return {g: seen[g][0] for g in gids if len(seen.get(g, [])) == 1}
+
+
+def _person_id_slug(values: dict, gid: str) -> str | None:
+    """The org's Grizz person-id field: the plan key whose value is the gid."""
+    return next((k for k, v in values.items() if v == gid), None)
+
+
+def run_native_people_sync(crm: str, contacts_path: Path, config_path: Path,
+                           enrich_email: bool, enrich_phone: bool, enrich_batch_size: int,
+                           poll_interval: int, poll_timeout: int,
+                           fuzzy_threshold: float, dry_run: bool) -> None:
+    """HubSpot / Salesforce contact sync, CLIENT-SIDE: Grizz returns the write
+    plan (people/prepare-writes) and this machine writes it with the operator's
+    own CRM credentials.  Grizz never receives them.
+
+    1. (optional, paid) enrich email/phone, so the plan carries them;
+    2. a first plan pass gives each contact's canonical parent company;
+    3. parents are resolved to CRM accounts (input crm_company_record_id first,
+       then the account's Grizz id field);
+    4. per account, the account's existing contacts go into a second plan pass,
+       which matches each person (grizz id → email → linkedin → fuzzy name);
+    5. writes use ONLY the plan: `values` on update, `values` + `on_create_values`
+       on create.  Nothing is written from local files."""
+    from grizz_enrichment.adapters.native_contacts import NATIVE_CONTACT_ADAPTERS
+
     api_key = os.environ.get("GRIZZ_API_KEY")
     if not api_key:
         console.print("[red]GRIZZ_API_KEY is not set.[/red] Add it to your [bold].env[/bold] file.")
         raise typer.Exit(1)
-    crm = crm.strip().lower()
-    credentials = _crm_contact_credentials(crm)   # validates env before any work
+    config = load_config(config_path) if config_path.exists() else {}
+    gid_field = ((config.get(crm) or {}).get("field_mapping") or {}).get("gid_company") \
+        or _DEFAULT_GID_FIELD[crm]
 
-    gids = list(dict.fromkeys(_read_person_gids(contacts_path)))  # de-dup, keep order
+    if contacts_path.suffix.lower() == ".json":
+        inputs = _read_person_records(contacts_path)
+    else:
+        inputs = [{"gid": g} for g in dict.fromkeys(_read_person_gids(contacts_path))]
+    inputs = [r for r in inputs if (r.get("gid") or r.get("gid_person"))]
+    for r in inputs:
+        r["gid"] = str(r.get("gid") or r.get("gid_person")).strip()
+    gids = list(dict.fromkeys(r["gid"] for r in inputs))
+    by_gid = {r["gid"]: r for r in inputs}
     if not gids:
         console.print(f"[red]No person gids found in {contacts_path}.[/red]")
         raise typer.Exit(1)
-    src = "HUBSPOT_API_KEY" if crm == "hubspot" else "SALESFORCE_SESSION_ID/INSTANCE_URL"
-    console.print(f"Loaded [bold]{len(gids)}[/bold] contact(s) from {contacts_path}; "
-                  f"CRM=[bold]{crm}[/bold] (creds from {src}).")
+    console.print(f"Loaded [bold]{len(gids)}[/bold] contact(s); CRM=[bold]{crm}[/bold] "
+                  f"(written from this machine — credentials stay local).")
 
-    # ── optional enrichment (spends credits) ─────────────────────────────────
+    adapter = NATIVE_CONTACT_ADAPTERS[crm]()
+    console.print(f"Connecting to {crm}...", end=" ")
+    try:
+        adapter.connect()
+    except Exception as e:
+        console.print(f"\n[red]Connection failed: {e}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]connected.[/green]")
+
     if enrich_email or enrich_phone:
         _run_enrich(api_key, gids, enrich_email, enrich_phone,
                     enrich_batch_size, poll_interval, poll_timeout)
 
-    records = [{"gid_person": g} for g in gids]
-    if dry_run:
-        console.print(f"[yellow]Dry run — {len(records)} record(s) resolved; "
-                      f"not writing to {crm}.[/yellow]")
-        return
+    def plan(gid_list: list[str], candidates: list[dict]) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for k in range(0, len(gid_list), 200):          # prepare-writes caps at 200
+            chunk = gid_list[k:k + 200]
+            resp = grizz_client.prepare_contact_writes(
+                api_key, crm, [{"gid_person": g} for g in chunk], candidates)
+            out.update(_plan_rows_by_gid(resp.get("records", []), chunk))
+        return out
 
-    # ── push in batches (server dedups + creates/updates per account) ────────
-    BATCH = 100
-    agg = {k: 0 for k in ("created", "updated", "no_grizz_match",
-                          "no_parent_match", "parent_linked", "errors")}
-    n_batches = (len(records) + BATCH - 1) // BATCH
-    for bi in range(0, len(records), BATCH):
-        chunk = records[bi:bi + BATCH]
-        n = bi // BATCH + 1
-        console.print(f"[{n}/{n_batches}] pushing {len(chunk)} contact(s)...", end=" ")
-        sub = grizz_client.create_in_crm_contacts(api_key, crm, credentials, chunk)
-        rid = sub.get("request_id")
-        final = _poll_until_terminal(
-            lambda: grizz_client.check_crm_write_request(api_key, rid),
-            poll_interval, poll_timeout)
-        if not final or final.get("status") != "COMPLETE":
-            console.print(f"[red]{(final or {}).get('status', 'timeout')}[/red] "
-                          f"{(final or {}).get('error_message', '')}")
-            agg["errors"] += len(chunk)
+    # ── pass 1: parent company per contact ───────────────────────────────────
+    first = plan(gids, [])
+    unpaired = [g for g in gids if g not in first]
+    no_match = [g for g in gids if g in first and not first[g].get("matched")]
+    live = [g for g in gids if g in first and first[g].get("matched")]
+    parent_gid = {g: (first[g].get("parent") or {}).get("gid_company") for g in live}
+
+    # ── resolve CRM accounts ─────────────────────────────────────────────────
+    explicit = {g: (by_gid[g].get("crm_company_record_id") or "").strip() for g in live}
+    want = sorted({pg for g, pg in parent_gid.items() if pg and not explicit[g]})
+    try:
+        acct_by_gid = adapter.account_ids_by_gid(want, gid_field) if want else {}
+    except Exception as e:
+        console.print(f"[red]Could not look up parent accounts by {gid_field}: {e}[/red]")
+        raise typer.Exit(1)
+    account = {g: explicit[g] or acct_by_gid.get(parent_gid.get(g) or "") or None for g in live}
+
+    # ── pass 2: match against each account's existing contacts ───────────────
+    # A contact whose company isn't in the CRM yet is skipped, never created
+    # unlinked: an orphan is outside every later run's account-scoped match,
+    # so each re-run would create it again.
+    no_parent = [g for g in live if not account[g]]
+    final: dict[str, dict] = {}
+    groups: dict[str, list[str]] = {}
+    for g in live:
+        if account[g]:
+            groups.setdefault(account[g], []).append(g)
+    sample_values = next((first[g].get("values") or {} for g in live), {})
+    id_slug = _person_id_slug(sample_values, live[0]) if live else None
+    read_fields = [k for k in sample_values if k == id_slug or "linkedin" in k.lower()]
+    for acct, members in groups.items():
+        try:
+            cands = adapter.contacts_for_account(acct, read_fields)
+        except Exception as e:
+            console.print(f"[red]Could not read account {acct}'s contacts ({e}); "
+                          f"skipping its {len(members)} contact(s) so none are duplicated.[/red]")
+            unpaired.extend(members)
             continue
-        for k in agg:
-            agg[k] += final.get(k, 0) or 0
-        console.print(f"[green]created={final.get('created', 0)} "
-                      f"updated={final.get('updated', 0)}[/green]")
+        got = plan(members, cands)
+        unpaired.extend(g for g in members if g not in got)
+        final.update(got)
 
-    console.print(f"\n[bold green]Done.[/bold green] "
-                  f"created={agg['created']}  updated={agg['updated']}  "
-                  f"no_grizz_match={agg['no_grizz_match']}  "
-                  f"no_parent_match={agg['no_parent_match']}  "
-                  f"parent_linked={agg['parent_linked']}  errors={agg['errors']}")
+    # ── decide ───────────────────────────────────────────────────────────────
+    updates: list[dict] = []
+    creates: list[tuple[str, dict, str | None]] = []
+    review: list[tuple[str, dict]] = []
+    for g in live:
+        row = final.get(g)
+        if not row or not account[g]:
+            continue
+        values = row.get("values") or {}
+        cm = row.get("crm_match")
+        if cm and cm.get("record_id"):
+            if cm.get("match_via") == "fuzzy" and (cm.get("confidence") or 0) < fuzzy_threshold:
+                review.append((g, cm))
+            else:
+                updates.append({"Id": cm["record_id"], **values})
+        else:
+            creates.append((g, {**values, **(row.get("on_create_values") or {})}, account[g]))
+
+    # Before creating, look across the WHOLE CRM: a contact already carrying the
+    # Grizz person id (e.g. linked to another account) is updated, not re-created.
+    # HubSpot also keeps email unique across the portal: an email in use becomes
+    # an update of that contact, unless it carries a different Grizz person id
+    # (a shared inbox, or two people) — then it goes to review, never merged.
+    email_field = {"hubspot": "email", "salesforce": "Email"}[crm]
+    by_pid = adapter.existing_by_person_id([c[0] for c in creates], id_slug) \
+        if (creates and id_slug) else {}
+    taken = adapter.existing_by_email([c[1].get(email_field) or "" for c in creates],
+                                      id_slug or "") if creates else {}
+    still: list[tuple[str, dict, str | None]] = []
+    for g, rec, acct in creates:
+        plan_values = final[g].get("values") or {}
+        if by_pid.get(g):
+            updates.append({"Id": by_pid[g], **plan_values})
+            continue
+        hit = taken.get((rec.get(email_field) or "").lower())
+        if hit:
+            cid, owner = hit
+            if owner and owner != g:
+                review.append((g, {"record_id": cid, "match_via": "email_other_person",
+                                   "confidence": 0.0}))
+            else:
+                updates.append({"Id": cid, **plan_values})
+            continue
+        still.append((g, rec, acct))
+    creates = still
+
+    console.print(f"  [green]{len(updates)} update[/green]  [yellow]{len(creates)} create[/yellow]"
+                  f"  [magenta]{len(review)} review[/magenta]"
+                  f"  no_parent_match={len(no_parent)}  no_grizz_match={len(no_match)}"
+                  f"  unpaired={len(unpaired)}")
+    if no_parent:
+        console.print(f"  [yellow]{len(no_parent)} contact(s) skipped: their company isn't in "
+                      f"{crm} yet (or has no {gid_field}). Sync the companies first "
+                      f"(`run.py audience` or `write`), then re-run.[/yellow]")
+    for g, cm in review[:10]:
+        console.print(f"    [dim]{g} → existing {cm['record_id']} "
+                      f"(conf {cm.get('confidence', 0):.2f}) — NOT written[/dim]")
+    if dry_run:
+        console.print(f"[yellow]Dry run — not writing to {crm}.[/yellow]")
+        return
+    if creates and not id_slug:
+        console.print("[red]The write plan carries no Grizz person-id field, so created "
+                      "contacts can't be paired safely. Run setup first.[/red]")
+        raise typer.Exit(1)
+
+    upd = adapter.update_contacts(updates) if updates else []
+    crt = adapter.create_contacts([c[1] for c in creates], id_slug or "",
+                                  [c[2] for c in creates]) if creates else []
+    upd_ok = sum(1 for r in upd if r.get("success"))
+    crt_ok = sum(1 for r in crt if r.get("success"))
+    linked = sum(1 for r in crt if r.get("linked"))
+    failures = [r for r in upd + crt if not r.get("success") or r.get("errors")]
+    for r in failures[:10]:
+        console.print(f"    [red]{r.get('id') or r.get('key')}: {r.get('errors')}[/red]")
+    console.print(f"\n[bold green]Done.[/bold green] updated={upd_ok}  created={crt_ok}  "
+                  f"parent_linked={linked}  review={len(review)}  "
+                  f"no_parent_match={len(no_parent)}  no_grizz_match={len(no_match)}  "
+                  f"unpaired={len(unpaired)}  errors={len(failures)}")
 
 
 # ── Attio contact sync (client-side, mirrors the company audience path) ─────────
@@ -1997,7 +2138,8 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
         if kind == "update":
             # Existing contact — write ONLY grizz_* attributes (never touch native
             # name/email/phone/company on a record Grizz didn't create).
-            to_update.append({"Id": rid, **mapped})
+            to_update.append({"Id": rid, **{k: v for k, v in mapped.items()
+                                            if k.lower().startswith("grizz_")}})
             via_counts[via] = via_counts.get(via, 0) + 1
         elif kind == "review":
             review.append((p, rid, conf))   # possible (fuzzy) dup — do NOT merge
@@ -2047,28 +2189,25 @@ def run_attio_people_sync(config_path: Path, contacts_path: Path,
 def people_sync(
     crm: str = typer.Option(..., "--crm", help="hubspot, salesforce, or attio"),
     contacts: Path = typer.Option(..., "--contacts", help="contacts.json from `people discover` (required for attio); or a CSV/txt of person gids (hubspot/salesforce)"),
-    config: Path = typer.Option(Path("config.yaml"), "--config", help="Path to your config.yaml (attio only — reads the attio_contacts mapping)."),
+    config: Path = typer.Option(Path("config.yaml"), "--config", help="Path to your config.yaml (attio: the attio_contacts mapping; hubspot/salesforce: the company Grizz id field)."),
     enrich_email: bool = typer.Option(False, "--enrich-email", help="Enrich work email before sync (spends credits)"),
     enrich_phone: bool = typer.Option(False, "--enrich-phone", help="Enrich phone before sync (spends credits)"),
     enrich_batch_size: int = typer.Option(50, "--enrich-batch-size", help="Contacts per enrich chunk (<=50 keeps each chunk inside the poll window)."),
     poll_interval: int = typer.Option(5, "--poll-interval", help="Seconds between status polls."),
     poll_timeout: int = typer.Option(900, "--poll-timeout", help="Soft per-chunk settle wait (seconds). NOT a correctness/charging boundary — a chunk that doesn't settle is reported as unsettled and safely finished by re-running the same command (already-entitled contacts are never re-charged). Raise it if chunks routinely don't settle (upstream retries under rate limit can exceed the default); don't lower it below ~600 or you'll churn re-runs."),
     batch_size: int = typer.Option(100, "--batch-size", help="Person records per write batch (attio only; the adapter parallelizes each batch)."),
-    fuzzy_threshold: float = typer.Option(0.9, "--fuzzy-threshold", help="Attio only. Min confidence to auto-merge a FUZZY name match (grizz_person_id/email/linkedin matches always merge). Fuzzy matches below this are surfaced for review, not written. Set 0 to accept all, 1.01 to never auto-merge a fuzzy match."),
+    fuzzy_threshold: float = typer.Option(0.9, "--fuzzy-threshold", help="Min confidence to auto-merge a FUZZY name match (grizz_person_id/email/linkedin matches always merge). Fuzzy matches below this are surfaced for review, not written. Set 0 to accept all, 1.01 to never auto-merge a fuzzy match."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve + count only; do not write to the CRM."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive (attio only)."),
 ):
     """Push discovered contacts to your CRM — create-OR-update, never duplicating.
 
-    HubSpot / Salesforce go through the server `/people/create-crm/` endpoint,
-    which matches each contact against its parent account's existing CRM contacts
-    (gid_person → email → linkedin → name).  Attio is headless, so it syncs
-    CLIENT-SIDE via the local Attio REST adapter — the same model as the company
-    `audience` flow — but reuses the SAME server dedup cascade via prepare-writes
-    (global strong keys + an account-scoped grizz_person_id → email → linkedin →
-    fuzzy-name match), and collapses city/state/country into ONE object-typed
-    location attribute. Discovery is free; email/phone enrichment
-    (--enrich-email/--enrich-phone) is a separate, paid step.
+    Every CRM syncs CLIENT-SIDE: this machine writes with your own CRM
+    credentials from .env, and Grizz never receives them. Grizz returns a write
+    plan that matches each contact against its account's existing contacts
+    (grizz person id → email → linkedin → name). Fuzzy name matches below
+    --fuzzy-threshold are listed for review, never merged. Discovery is free;
+    email/phone enrichment (--enrich-email/--enrich-phone) is a separate, paid step.
     """
     if not contacts.exists():
         console.print(f"[red]Contacts file not found: {contacts}[/red]")
@@ -2081,8 +2220,12 @@ def people_sync(
                               max(1, min(batch_size, 200)), dry_run, yes,
                               fuzzy_threshold=fuzzy_threshold)
         return
-    run_people_sync(crm, contacts, enrich_email, enrich_phone, enrich_batch_size,
-                    poll_interval, poll_timeout, dry_run)
+    if crm not in ("hubspot", "salesforce"):
+        console.print(f"[red]Contact sync is not supported for CRM '{crm}'.[/red]")
+        raise typer.Exit(1)
+    run_native_people_sync(crm, contacts, config, enrich_email, enrich_phone,
+                           enrich_batch_size, poll_interval, poll_timeout,
+                           fuzzy_threshold, dry_run)
 
 
 @app.command()
@@ -2091,7 +2234,7 @@ def enrich(
     input: Path = typer.Option(..., help="CSV file containing account IDs (requires an 'Id' column)"),
     config: Path = typer.Option(Path("config.yaml"), help="Path to your config.yaml"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview CRM changes without writing them. Still runs the Grizz enrichment for each account, and each accepted one counts as an enrichment call."),
-    concurrency: int = typer.Option(12, "--concurrency", help="Parallel enrich+write workers (these CRMs have no batch-write API, so throughput comes from concurrency). Ignored in --dry-run."),
+    concurrency: int = typer.Option(4, "--concurrency", help="Parallel enrich+write workers (default 4, kept low so bulk runs stay gentle on the Grizz API; the run stops at the first Grizz server error). Ignored in --dry-run."),
 ):
     """Enrich CRM accounts from a CSV of account IDs using the Grizz API.
 
@@ -2186,23 +2329,40 @@ def write(
 
 
 def _run_setup(crm: str, contacts: bool, dry_run: bool, config_path: Path) -> None:
-    """Route to the company or contact setup for the chosen CRM.  The Salesforce/
-    HubSpot contact setups provision exactly the grizz_contact_* properties
-    create-crm writes — identical to what the `setup_crm_contacts` MCP tool
-    creates.  Attio is CONFIG-DRIVEN: it provisions only the attributes mapped in
-    config.yaml, on just the one object requested, so contact setup never touches
-    the Companies object (and vice versa)."""
+    """Route to the company or contact setup for the chosen CRM.  Runs on this
+    machine with your own CRM credentials; Grizz never receives them.  The
+    Salesforce/HubSpot setups provision the grizz_* properties the write plans
+    use.  Attio is CONFIG-DRIVEN: it provisions only the attributes mapped in
+    config.yaml, on just the one object requested.
+
+    After a successful (non-dry-run) setup, the org's Grizz field mappings are
+    seeded and marked synced, so the dashboard's setup to-dos close."""
     if crm == "salesforce":
-        (run_setup_salesforce_contacts if contacts else run_setup_salesforce)(dry_run=dry_run)
+        outcome = (run_setup_salesforce_contacts if contacts else run_setup_salesforce)(dry_run=dry_run)
     elif crm == "hubspot":
-        (run_setup_hubspot_contacts if contacts else run_setup_hubspot)(dry_run=dry_run)
+        outcome = (run_setup_hubspot_contacts if contacts else run_setup_hubspot)(dry_run=dry_run)
     elif crm == "attio":
-        run_setup_attio(dry_run=dry_run,
-                        object_="contacts" if contacts else "company",
-                        config_path=config_path)
+        outcome = run_setup_attio(dry_run=dry_run,
+                                  object_="contacts" if contacts else "company",
+                                  config_path=config_path)
     else:
         console.print(f"[red]Setup not yet available for '{crm}'.[/red]")
         raise typer.Exit(1)
+    if dry_run or not isinstance(outcome, dict) or outcome.get("errors"):
+        return   # nothing recorded with Grizz unless setup fully succeeded
+    api_key = os.environ.get("GRIZZ_API_KEY")
+    if not api_key:
+        console.print("[yellow]GRIZZ_API_KEY is not set, so the dashboard won't know setup "
+                      "ran. Add it to .env and re-run setup.[/yellow]")
+        return
+    obj = "person" if contacts else "company"
+    try:
+        grizz_client.seed_field_mappings(api_key, crm, obj)
+        grizz_client.mark_field_mappings_synced(api_key, crm, [obj])
+        console.print("[green]Grizz field mappings recorded.[/green]")
+    except Exception as e:
+        console.print(f"[yellow]Setup finished in {crm}, but recording it with Grizz "
+                      f"failed ({e}). Re-run setup to retry.[/yellow]")
 
 
 @app.command()

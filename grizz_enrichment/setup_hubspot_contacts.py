@@ -1,8 +1,7 @@
 """Create all recommended Grizz custom properties on HubSpot Contact records.
 
-Kept in lock-step with the MCP's grizz_enrichment/setup_hubspot_contacts.py so
-CLI setup and the `setup_crm_contacts` MCP tool provision the SAME properties —
-create-crm writes exactly these, so they must match what the portal has.
+Contact sync writes exactly these properties, so they must exist in the portal
+before the first `people sync`.
 """
 
 import os
@@ -29,8 +28,8 @@ GRIZZ_PROPERTIES = [
         # HubSpot enforces hasUniqueValue at write time, so a unique constraint
         # 409s every write after the first in a duplicate cluster — and because
         # record writes are atomic, that also blocks the record's other grizz_*
-        # fields. Same failure mode as the company grizz_company_id fix
-        # (GRIZZ-135). Uniqueness isn't needed to match (search works regardless).
+        # fields. Same failure mode as the company grizz_company_id field.
+        # Uniqueness isn't needed to match (search works regardless).
     },
     {
         "name":      "grizz_contact_linkedin_url",
@@ -239,7 +238,7 @@ def _ensure_property_group(session: requests.Session) -> None:
     resp.raise_for_status()
 
 
-def run_setup(dry_run: bool = False) -> None:
+def run_setup(dry_run: bool = False) -> dict:
     """Connect to HubSpot and create all Grizz custom properties on Contact records."""
 
     # ── Connect ──────────────────────────────────────────────────────────────
@@ -247,7 +246,7 @@ def run_setup(dry_run: bool = False) -> None:
     token = os.environ.get("HUBSPOT_API_KEY")
     if not token:
         console.print("\n[red]HUBSPOT_API_KEY is not set.[/red]")
-        return
+        return {"errors": ["could not connect"]}
 
     session = requests.Session()
     session.headers.update({
@@ -258,12 +257,12 @@ def run_setup(dry_run: bool = False) -> None:
     resp = session.get(f"{_BASE_URL}/crm/v3/objects/contacts", params={"limit": 1}, timeout=10)
     if resp.status_code == 401:
         console.print("\n[red]HUBSPOT_API_KEY is invalid or lacks required scopes.[/red]")
-        return
+        return {"errors": ["could not connect"]}
     try:
         resp.raise_for_status()
     except Exception as e:
         console.print(f"\n[red]Connection failed: {e}[/red]")
-        return
+        return {"errors": ["could not connect"]}
     console.print("[green]connected.[/green]")
 
     if dry_run:
@@ -343,3 +342,4 @@ def run_setup(dry_run: bool = False) -> None:
         "  2. Scroll to the bottom of the properties panel and click 'Edit properties'\n"
         "  3. Search for 'Grizz' and add the fields you want[/dim]"
     )
+    return {"errors": [f"{errors} field(s) failed"] if errors else []}
