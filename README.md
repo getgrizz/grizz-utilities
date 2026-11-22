@@ -402,7 +402,9 @@ account. A contact whose company isn't in your CRM yet is skipped and counted as
 then re-run. A contact that already carries its Grizz person id anywhere in the CRM
 is updated, not created again. Fuzzy name matches below `--fuzzy-threshold` are listed for review, never
 merged. In HubSpot, a contact whose email already exists anywhere in the portal is
-updated rather than duplicated.
+updated rather than duplicated, unless that contact already belongs to a different
+Grizz person, in which case it is listed for review. A CRM contact that two Grizz
+people match is never written; both are listed for review.
 
 ## Attio
 

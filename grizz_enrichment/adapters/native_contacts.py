@@ -278,15 +278,16 @@ class SalesforceContactAdapter:
             for g in got.get("records", []):
                 if g.get(key_field):
                     by_key[g[key_field]] = g["Id"]
-        errors = [x.get("errors") for x in res if not x.get("success")]
+        # Error text by input index — for messages only, never to pair ids.
+        err_at = {i: x.get("errors") for i, x in enumerate(res) if not x.get("success")}
         out = []
         acct_by_key = {r.get(key_field): a for r, a in zip(records, account_ids)}
-        for r in records:
+        for i, r in enumerate(records):
             k = r.get(key_field)
             cid = by_key.get(k)
             out.append({"key": k, "id": cid, "success": bool(cid),
                         "linked": bool(cid and acct_by_key.get(k)),
-                        "errors": [] if cid else (["create failed"] + [str(e) for e in errors[:1]])})
+                        "errors": [] if cid else ["create failed: " + str(err_at.get(i) or "no id returned")]})
         return out
 
 

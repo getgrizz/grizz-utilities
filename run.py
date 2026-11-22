@@ -180,7 +180,7 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
             # timeout / dropped connection means the API is struggling: stop.
             status = getattr(getattr(e, "response", None), "status_code", 0) or 0
             if status >= 500 or status == 429 or isinstance(
-                    e, (requests.Timeout, requests.ConnectionError)):
+                    e, (requests.Timeout, requests.ConnectionError, TimeoutError)):
                 halt.set()
             return (account_id, "error", str(e))
         if res["outside_plan"]:
@@ -1706,6 +1706,7 @@ def run_native_people_sync(crm: str, contacts_path: Path, config_path: Path,
     # so each re-run would create it again.
     no_parent = [g for g in live if not account[g]]
     final: dict[str, dict] = {}
+    owner_of: dict[str, str] = {}      # CRM contact id → the Grizz person id it already carries
     groups: dict[str, list[str]] = {}
     for g in live:
         if account[g]:
@@ -1724,6 +1725,11 @@ def run_native_people_sync(crm: str, contacts_path: Path, config_path: Path,
         got = plan(members, cands)
         unpaired.extend(g for g in members if g not in got)
         final.update(got)
+        for c in cands:
+            props = c.get("properties") if isinstance(c.get("properties"), dict) else c
+            rid = str(c.get("id") or c.get("Id") or "")
+            if rid and id_slug and props.get(id_slug):
+                owner_of[rid] = str(props[id_slug])
 
     # ── decide ───────────────────────────────────────────────────────────────
     updates: list[dict] = []
@@ -1736,7 +1742,12 @@ def run_native_people_sync(crm: str, contacts_path: Path, config_path: Path,
         values = row.get("values") or {}
         cm = row.get("crm_match")
         if cm and cm.get("record_id"):
-            if cm.get("match_via") == "fuzzy" and (cm.get("confidence") or 0) < fuzzy_threshold:
+            owner = owner_of.get(str(cm["record_id"]))
+            if owner and owner != g:
+                # email / linkedin / name hit on a contact that is already a
+                # different Grizz person: never merge two people
+                review.append((g, {**cm, "match_via": f"{cm.get('match_via')}_other_person"}))
+            elif cm.get("match_via") == "fuzzy" and (cm.get("confidence") or 0) < fuzzy_threshold:
                 review.append((g, cm))
             else:
                 updates.append({"Id": cm["record_id"], **values})
@@ -1770,6 +1781,23 @@ def run_native_people_sync(crm: str, contacts_path: Path, config_path: Path,
             continue
         still.append((g, rec, acct))
     creates = still
+
+    # One CRM contact claimed by two Grizz people (e.g. a shared inbox): write
+    # neither, list both for review.
+    claims: dict[str, list[dict]] = {}
+    for u in updates:
+        claims.setdefault(str(u["Id"]), []).append(u)
+    if any(len(v) > 1 for v in claims.values()):
+        kept = []
+        for cid, us in claims.items():
+            if len(us) == 1:
+                kept.append(us[0])
+                continue
+            for u in us:
+                review.append((str(u.get(id_slug) or "?"),
+                               {"record_id": cid, "match_via": "shared_by_several_people",
+                                "confidence": 0.0}))
+        updates = kept
 
     console.print(f"  [green]{len(updates)} update[/green]  [yellow]{len(creates)} create[/yellow]"
                   f"  [magenta]{len(review)} review[/magenta]"
