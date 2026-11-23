@@ -23,6 +23,28 @@ This project uses [Semantic Versioning](https://semver.org/).
 - **`enrich` is gentler on the API.** Default concurrency is 4, and the run stops
   at the first server error, timeout or exhausted rate limit; unfinished accounts
   are written to `<input>_rerun.csv` for the re-run.
+- **`enrich` re-runs no longer enrich an account twice.** The rerun file is written
+  as the run goes (Ctrl-C, a closed terminal or an error still write it; a hard kill
+  can leave it incomplete) and records where each account
+  got to. Re-running it checks on accounts already submitted and only redoes the
+  CRM write for accounts already enriched; neither counts as a new enrichment
+  call. Accounts that can't be enriched, or are outside your plan, are left out.
+  If an account's CRM domain changed since, it is enriched again (one new call);
+  if its earlier request expired, it goes back in the rerun file for the next run.
+- **`enrich` never re-sends, within a run, a submit that may have counted.** If a
+  submit gets no reply, the run stops and the account goes in the rerun file,
+  marked as not confirmed (re-running it may count it again). Status checks still retry through brief network trouble. A gateway
+  error pauses every worker for a moment and allows one retry; any other server
+  error stops the run at once, as do reaching the monthly enrichment limit and a
+  request that hasn't finished within 5 minutes.
+- **`enrich` paces bulk runs.** Accounts go in batches of `--batch-size` (100) with
+  a `--pause` (120 s) between them, submits are spaced across workers, and
+  `--concurrency` is capped at 4 unless `--allow-high-concurrency` is given. A
+  request now has 5 minutes to finish, up from 2. Set `GRIZZ_SUBMIT_TIMEOUT` to
+  change how long a submit waits for its reply (default 90 s).
+- **HubSpot rate limits.** Single-record reads and writes wait out HubSpot's rate
+  limit; if your CRM keeps refusing, the run stops instead of enriching accounts
+  it can't write.
 - **`setup` records itself with Grizz.** After a successful setup, the org's field
   mappings are seeded and marked synced, so the dashboard's setup to-dos close.
 

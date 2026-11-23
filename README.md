@@ -144,6 +144,10 @@ python run.py enrich --crm hubspot --input companies.csv
 | `--input` | Path to CSV file with an `Id` or `Account ID` column |
 | `--config` | Path to config file (default: `config.yaml`) |
 | `--dry-run` | Preview changes without writing to the CRM |
+| `--concurrency` | Parallel workers (default and maximum 4; `--allow-high-concurrency` to go higher) |
+| `--batch-size` / `--pause` | Accounts per batch (default 100) and seconds between batches (default 120; `0` for none) |
+
+If the run stops early (a server error, the monthly limit, Ctrl-C), the accounts still to do are in `<input>_rerun.csv`, written as the run goes. Re-run with `--input <input>_rerun.csv`: accounts already submitted are checked on and written to the CRM, not enriched again (an account whose CRM domain changed is enriched again; one whose earlier request expired goes back in the rerun file; one whose last submit got no reply is sent again and may count a second time). A dry run writes `<input>_rerun.dry-run.csv` instead, so it never replaces a real rerun file.
 
 **Push a Grizz company list to CRM:**
 

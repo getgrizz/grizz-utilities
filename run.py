@@ -13,10 +13,10 @@ Headless usage:
 import csv
 import json
 import os
+import signal
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -97,8 +97,72 @@ def read_account_ids(input_file: Path) -> list[str]:
 
 # ── Core enrichment logic ──────────────────────────────────────────────────────
 
+RERUN_COLUMNS = ["Id", "stage", "request_id", "domain", "submitted_at", "reason"]
+# Rerun stages, by what a re-run does with the row:
+#   not_started     enrich it (counts as one enrichment call)
+#   submit_unknown  enrich it; the earlier submit may already have counted
+#   polling         accepted earlier: check on it and fetch the results (free)
+#   write_failed    enriched earlier: fetch the results again (free) and write
+_STAGE_TEXT = {
+    "not_started": "not yet enriched",
+    "submit_unknown": "not confirmed (the last attempt got no reply; re-running may count it again)",
+    "polling": "enriched, not yet written",
+    "write_failed": "enriched, not yet written",
+}
+MAX_ENRICH_CONCURRENCY = 4
+
+
+def _read_enrich_rows(input_file: Path) -> list[dict]:
+    """Rows for `enrich`: a plain CSV with an Id column, or a rerun file."""
+    ids = read_account_ids(input_file)
+    with open(input_file, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows or "stage" not in rows[0]:
+        return [{"Id": i} for i in ids]
+    out = []
+    for r in rows:
+        aid = (r.get("Id") or "").strip()
+        if aid:
+            out.append({k: (r.get(k) or "").strip() for k in RERUN_COLUMNS} | {"Id": aid})
+    return out
+
+
+def _is_crm_rate_limit(e: Exception) -> bool:
+    status = getattr(getattr(e, "response", None), "status_code", 0) or 0
+    text = str(e)
+    return status == 429 or "REQUEST_LIMIT_EXCEEDED" in text or "rate limit" in text.lower()
+
+
+class _RerunFile:
+    """Append-only rerun file, flushed after every row. Ctrl-C, SIGTERM/SIGHUP
+    and Python errors still write what's left; a hard kill (SIGKILL, power loss)
+    can leave it incomplete."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.count = 0
+        self.by_stage: dict[str, int] = {}
+        self._f = None
+        self._w = None
+
+    def add(self, row: dict) -> None:
+        if self._f is None:
+            self._f = open(self.path, "w", newline="", encoding="utf-8")
+            self._w = csv.DictWriter(self._f, fieldnames=RERUN_COLUMNS)
+            self._w.writeheader()
+        self._w.writerow({k: row.get(k, "") for k in RERUN_COLUMNS})
+        self._f.flush()
+        self.count += 1
+        self.by_stage[row["stage"]] = self.by_stage.get(row["stage"], 0) + 1
+
+    def close(self) -> None:
+        if self._f:
+            self._f.close()
+
+
 def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
-               concurrency: int = 4) -> None:
+               concurrency: int = 4, batch_size: int = 100, pause: int = 120,
+               allow_high_concurrency: bool = False) -> None:
     """Fetch domains from CRM, enrich via Grizz, write results back."""
 
     # ── Config ──────────────────────────────────────────────────────────────
@@ -139,88 +203,266 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         adapter.set_phone_slugs(_attio_phone_slugs(crm_config))
 
     # ── Input ────────────────────────────────────────────────────────────────
-    account_ids = read_account_ids(input_file)
-    console.print(f"Loaded [bold]{len(account_ids)}[/bold] account(s) from {input_file}.")
+    rows = _read_enrich_rows(input_file)
+    console.print(f"Loaded [bold]{len(rows)}[/bold] account(s) from {input_file}.")
+    resumed = sum(1 for r in rows if r.get("request_id"))
+    if resumed:
+        console.print(f"{resumed} of them were submitted earlier and are checked on "
+                      f"first (free). One whose CRM domain changed is enriched again "
+                      f"(one new call); one whose earlier request expired goes back in "
+                      f"the rerun file for the next run.")
+    unknown = sum(1 for r in rows if r.get("stage") == "submit_unknown")
+    if unknown:
+        console.print(f"[yellow]{unknown} account(s) got no reply last time; their "
+                      f"earlier attempt may already have counted, and re-running "
+                      f"them may count again.[/yellow]")
 
     if dry_run:
         console.print("[yellow]Dry run mode — CRM will not be updated.[/yellow]")
+    if concurrency > MAX_ENRICH_CONCURRENCY and not allow_high_concurrency:
+        console.print(f"[yellow]Concurrency capped at {MAX_ENRICH_CONCURRENCY} "
+                      f"(pass --allow-high-concurrency to go higher).[/yellow]")
+        concurrency = MAX_ENRICH_CONCURRENCY
 
     console.print()
 
     # ── Process ──────────────────────────────────────────────────────────────
-    # Attio (and the other CRMs here) have no batch-write API, so throughput
-    # comes from concurrency; the adapters' requests.Session is thread-safe.
-    # Dry-run stays single-threaded for a readable, ordered preview.
-    total = len(account_ids)
+    total = len(rows)
     sync_ts = _sync_timestamp()
+    guard = grizz_client.RunGuard()
+    # A dry run keeps its own file, so it never displaces a real run's rerun file.
+    rerun = _RerunFile(input_file.with_name(
+        input_file.stem + ("_rerun.dry-run.csv" if dry_run else "_rerun.csv")))
+    if rerun.path.exists():
+        prev = rerun.path.with_name(rerun.path.stem + ".prev.csv")
+        rerun.path.replace(prev)
+        console.print(f"[dim]Moved the previous {rerun.path.name} to {prev.name}.[/dim]")
 
-    halt = threading.Event()   # set on the first Grizz 5xx: stop, don't hammer the API
+    def _now() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def _process(account_id: str) -> tuple[str, str, str]:
+    def _redo(row: dict, stage: str | None = None, reason: str = "", **extra) -> dict:
+        """The rerun row for `row`, keeping what it already knew."""
+        out = {k: row.get(k, "") for k in RERUN_COLUMNS}
+        if stage:
+            out["stage"] = stage
+        out["stage"] = out["stage"] or "not_started"
+        out.update({k: v for k, v in extra.items() if v is not None})
+        if out["stage"] in ("not_started", "submit_unknown"):
+            out["request_id"] = ""
+            out["submitted_at"] = ""
+        out["reason"] = reason
+        return out
+
+    def _stopped(row: dict) -> tuple:
+        return (row["Id"], "not_run", guard.stop_reason or "stopped", _redo(row, reason="stopped"))
+
+    inflight: dict[str, tuple[str, str, str]] = {}   # Id -> (request_id, domain, submitted_at)
+    submitting: set[str] = set()   # Ids whose submit is on the wire (outcome not yet known)
+
+    def _process(row: dict) -> tuple:
         """Enrich one account end-to-end (get domain → Grizz → write).
-        Returns (account_id, outcome, detail); isolates its own errors so a
-        single bad record never aborts the pool, except a Grizz server error,
-        which stops the run."""
-        if halt.is_set():
-            return (account_id, "not_run", "stopped after a Grizz server error")
+        Returns (account_id, outcome, detail, rerun_row | None). Never raises."""
+        aid = row["Id"]
+        if guard.stop.is_set():
+            return _stopped(row)
         try:
-            domain = adapter.get_domain(account_id, domain_field)
+            domain = adapter.get_domain(aid, domain_field)
         except Exception as e:
-            return (account_id, "error", str(e))
+            if _is_crm_rate_limit(e):
+                guard.halt(f"{crm.title()} is rate-limiting requests")
+            return (aid, "error", str(e), _redo(row, reason="crm_read"))
         if not domain:
-            return (account_id, "skipped", "no domain")
-        if halt.is_set():
-            return (account_id, "not_run", "stopped after a Grizz server error")
+            return (aid, "skipped", "no domain", None)
+
+        request_id = row.get("request_id") or None
+        if request_id and row.get("domain") and row["domain"] != domain:
+            request_id = None   # the CRM domain changed since: enrich the new one
+        submitted_at = row.get("submitted_at") if request_id else _now()
+
+        if guard.stop.is_set():
+            return _stopped(row)
+        if not request_id:
+            submitting.add(aid)
         try:
-            # No per-poll on_status spinner — interleaved \r writes are unreadable
-            # across threads.
-            res = grizz_client.enrich_detailed(grizz_api_key, domain)
+            res = grizz_client.enrich_detailed(
+                grizz_api_key, domain, guard=guard, request_id=request_id,
+                on_submitted=lambda rid: inflight.__setitem__(aid, (rid, domain, submitted_at)))
+        except grizz_client.EnrichFailed as e:
+            return (aid, "failed", str(e), None)
+        except grizz_client.InFlight as e:
+            cause = getattr(e, "cause", None)
+            if getattr(getattr(cause, "response", None), "status_code", 0) == 404:
+                return (aid, "error", "earlier request expired",
+                        _redo(row, "not_started", "expired"))
+            if isinstance(e, grizz_client.PollTimeout):
+                # Prod's slowest enrichment is well under the poll window: a
+                # timeout means the queue is stuck. Stop before counting more.
+                guard.halt("a request didn't finish within 5 minutes")
+            return (aid, "not_finished", str(e),
+                    _redo(row, "polling", "polling", request_id=e.request_id,
+                          domain=domain, submitted_at=submitted_at))
+        except grizz_client.SubmitUnknown as e:
+            return (aid, "error", str(e), _redo(row, "submit_unknown", "no_reply", domain=domain))
+        except grizz_client.MonthlyLimitReached as e:
+            return (aid, "not_run", str(e), _redo(row, reason="monthly_limit"))
+        except grizz_client.RunStopped:
+            return _stopped(row)
+        except grizz_client.ServerError as e:
+            return (aid, "not_run", str(e), _redo(row, reason="server_error"))
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", 0) or 0
+            if status in (401, 403):
+                guard.halt("the Grizz API key was refused")
+                return (aid, "not_run", str(e), _redo(row, reason="auth"))
+            if status == 429:   # refused, so not counted: keep it for the re-run
+                guard.halt("the Grizz API kept rate-limiting")
+                return (aid, "not_run", str(e), _redo(row, reason="rate_limited"))
+            # A rejected input: re-running it would be rejected again.
+            return (aid, "error", str(e), None)
         except Exception as e:
-            # The client already retried; a 5xx, a still-failing 429, or a
-            # timeout / dropped connection means the API is struggling: stop.
-            status = getattr(getattr(e, "response", None), "status_code", 0) or 0
-            if status >= 500 or status == 429 or isinstance(
-                    e, (requests.Timeout, requests.ConnectionError, TimeoutError)):
-                halt.set()
-            return (account_id, "error", str(e))
+            guard.halt("an unexpected error from the Grizz API")
+            return (aid, "error", str(e), _redo(row, "submit_unknown", "unexpected", domain=domain))
+
+        rid = res["request_id"]
         if res["outside_plan"]:
             # In Grizz, but not in this account's plan: nothing to write, don't re-enrich it.
-            return (account_id, "outside_plan", domain)
+            return (aid, "outside_plan", domain, None)
         grizz_data = res["company"]
         if grizz_data is None:
-            return (account_id, "no_data", domain)
+            return (aid, "no_data", domain, None)
+        # Built from the current config.yaml every time, never replayed.
         # Stamped only when the record is actually written, and only if
         # config.yaml maps `last_sync` — see _grizz_data.
-        updates = apply_mapping({**grizz_data, "last_sync": sync_ts}, field_mapping)
-        if not updates:
-            return (account_id, "no_updates", domain)
-        if dry_run:
-            return (account_id, "dry_run", f"{domain}: {', '.join(updates.keys())}")
         try:
-            adapter.update_record(account_id, updates)
-            return (account_id, "success", domain)
+            updates = apply_mapping({**grizz_data, "last_sync": sync_ts}, field_mapping)
         except Exception as e:
-            return (account_id, "error", str(e))
+            guard.halt("the field mapping failed (check config.yaml)")
+            return (aid, "write_failed", f"mapping: {e}",
+                    _redo(row, "write_failed", "mapping", request_id=rid,
+                          domain=domain, submitted_at=submitted_at))
+        if not updates:
+            return (aid, "no_updates", domain, None)
+        if dry_run:
+            return (aid, "dry_run", f"{domain}: {', '.join(updates.keys())}", None)
+        try:
+            adapter.update_record(aid, updates)
+            return (aid, "success", domain, None)
+        except Exception as e:
+            if _is_crm_rate_limit(e):
+                guard.halt(f"{crm.title()} is rate-limiting writes")
+            return (aid, "write_failed", str(e),
+                    _redo(row, "write_failed", "crm_write", request_id=rid,
+                          domain=domain, submitted_at=submitted_at))
 
     summary: list[tuple[str, str, str]] = []  # (account_id, outcome, detail)
+    recorded: set[int] = set()
 
-    if dry_run or concurrency <= 1:
-        for i, account_id in enumerate(account_ids, 1):
-            result = _process(account_id)
-            summary.append(result)
-            _, outcome, detail = result
-            console.print(f"[{i}/{total}] {account_id} — {outcome}"
-                          + (f" ({detail})" if detail else ""))
-    else:
-        console.print(f"Enriching {total} account(s) with concurrency={concurrency}...")
-        done = 0
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(_process, aid) for aid in account_ids]
-            for fut in as_completed(futures):
-                summary.append(fut.result())
-                done += 1
-                if done % 25 == 0 or done == total:
-                    console.print(f"  ...{done}/{total} processed")
+    def _record(idx: int, result: tuple) -> None:
+        aid, outcome, detail, redo = result
+        recorded.add(idx)
+        summary.append((aid, outcome, detail))
+        if redo:
+            rerun.add(redo)
+
+    workers = 1 if dry_run else max(1, concurrency)
+    if workers > 1:
+        console.print(f"Enriching {total} account(s) with concurrency={workers}, "
+                      f"{batch_size} per batch...")
+    done = 0
+    batch_size = max(1, batch_size)
+    all_futures: dict = {}
+    completed = False
+
+    def _on_signal(signum, frame):
+        raise KeyboardInterrupt
+    old_handlers = {}
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            try:
+                old_handlers[sig] = signal.signal(sig, _on_signal)
+            except ValueError:   # not the main thread
+                pass
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for start in range(0, total, batch_size):
+                if guard.stop.is_set():
+                    break
+                if start and pause > 0:
+                    console.print(f"  Pausing {pause}s between batches...")
+                    try:
+                        guard.sleep(pause)
+                    except grizz_client.RunStopped:
+                        break
+                batch = list(enumerate(rows))[start:start + batch_size]
+                futures = {pool.submit(_process, r): i for i, r in batch}
+                all_futures.update(futures)
+                try:
+                    for fut in as_completed(futures):
+                        i = futures[fut]
+                        try:
+                            result = fut.result()
+                        except Exception:
+                            guard.halt("an unexpected error")
+                            raise
+                        _record(i, result)
+                        done += 1
+                        if workers == 1:
+                            aid, outcome, detail = summary[-1]
+                            console.print(f"[{done}/{total}] {aid} — {outcome}"
+                                          + (f" ({detail})" if detail else ""))
+                        elif done % 25 == 0 or done == total:
+                            console.print(f"  ...{done}/{total} processed")
+                except KeyboardInterrupt:
+                    guard.halt("interrupted")
+                    console.print("[yellow]Stopping: waiting for in-flight accounts...[/yellow]")
+                    for fut, i in futures.items():
+                        if i not in recorded:
+                            try:
+                                _record(i, fut.result())
+                            except BaseException:
+                                pass
+                    break
+        completed = True
+    except KeyboardInterrupt:
+        guard.halt("interrupted")
+    finally:
+        if not completed:
+            guard.halt(guard.stop_reason or "interrupted")
+        # Don't let another Ctrl-C cut the rerun file short.
+        try:
+            old_handlers.setdefault(signal.SIGINT, signal.signal(signal.SIGINT, signal.SIG_IGN))
+            for sig in list(old_handlers):
+                signal.signal(sig, signal.SIG_IGN)
+        except ValueError:
+            pass
+        # Give submits already on the wire time to land, so their ids are kept.
+        running = [f for f in all_futures if not f.done()]
+        if running:
+            wait(running, timeout=grizz_client.SUBMIT_TIMEOUT + grizz_client.CONNECT_TIMEOUT)
+        # Results that did finish, then anything never processed (stop, Ctrl-C,
+        # crash): an accepted submit keeps its request id, the rest go back as they were.
+        for fut, i in all_futures.items():
+            if i not in recorded and fut.done() and not fut.cancelled():
+                try:
+                    _record(i, fut.result())
+                except BaseException:
+                    pass
+        for i, r in enumerate(rows):
+            if i in recorded:
+                continue
+            summary.append((r["Id"], "not_run", guard.stop_reason or "not run"))
+            if r["Id"] in inflight:
+                rid, dom, at = inflight[r["Id"]]
+                rerun.add(_redo(r, "polling", "not_run", request_id=rid, domain=dom,
+                                submitted_at=at))
+            elif r["Id"] in submitting:
+                rerun.add(_redo(r, "submit_unknown", "not_run"))
+            else:
+                rerun.add(_redo(r, reason="not_run"))
+        rerun.close()
+        for sig, h in old_handlers.items():
+            signal.signal(sig, h)
 
     # ── Summary ──────────────────────────────────────────────────────────────
     console.print()
@@ -236,7 +478,10 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         "skipped": "yellow",
         "no_updates": "yellow",
         "outside_plan": "magenta",
+        "failed": "red",
         "error": "red",
+        "write_failed": "red",
+        "not_finished": "red",
         "not_run": "red",
     }
 
@@ -245,19 +490,28 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
         table.add_row(account_id, f"[{color}]{outcome}[/{color}]", detail)
 
     console.print(table)
-    if halt.is_set():
-        todo = [aid for aid, o, _ in summary if o in ("not_run", "error")]
-        rerun = input_file.with_name(input_file.stem + "_rerun.csv")
-        rerun.write_text("Id\n" + "".join(f"{a}\n" for a in todo), encoding="utf-8")
-        console.print(f"[red]Stopped at the first Grizz server error.[/red] The {len(todo)} "
-                      f"account(s) not finished are in [bold]{rerun}[/bold]. Re-run later with "
-                      f"`--input {rerun}` so finished accounts aren't enriched again.")
+    if guard.stop.is_set():
+        console.print(f"[red]Stopped: {guard.stop_reason}.[/red]")
+    if rerun.count:
+        parts = {}
+        for stage, n in rerun.by_stage.items():
+            text = _STAGE_TEXT.get(stage, stage)
+            parts[text] = parts.get(text, 0) + n
+        breakdown = "; ".join(f"{n} {t}" for t, n in parts.items())
+        console.print(f"{rerun.count} account(s) still to do ({breakdown}) are in "
+                      f"[bold]{rerun.path}[/bold]. Re-run later with "
+                      f"`--input {rerun.path}`: accounts already enriched are only "
+                      f"written, not enriched again.")
 
     success_count = sum(1 for _, o, _ in summary if o in ("success", "dry_run"))
     console.print(
-        f"\n[bold]Done:[/bold] {success_count}/{len(account_ids)} "
+        f"\n[bold]Done:[/bold] {success_count}/{total} "
         f"{'previewed' if dry_run else 'updated'}."
     )
+    failed = sum(1 for _, o, _ in summary if o == "failed")
+    if failed:
+        console.print(f"[yellow]{failed} account(s) couldn't be enriched[/yellow] "
+                      f"(not in the rerun file: re-running them won't help).")
     outside = sum(1 for _, o, _ in summary if o == "outside_plan")
     if outside:
         console.print(f"[magenta]{outside} account(s) are in Grizz but outside your plan[/magenta] "
@@ -2262,16 +2516,22 @@ def enrich(
     input: Path = typer.Option(..., help="CSV file containing account IDs (requires an 'Id' column)"),
     config: Path = typer.Option(Path("config.yaml"), help="Path to your config.yaml"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview CRM changes without writing them. Still runs the Grizz enrichment for each account, and each accepted one counts as an enrichment call."),
-    concurrency: int = typer.Option(4, "--concurrency", help="Parallel enrich+write workers (default 4, kept low so bulk runs stay gentle on the Grizz API; the run stops at the first Grizz server error). Ignored in --dry-run."),
+    concurrency: int = typer.Option(4, "--concurrency", help="Parallel enrich+write workers (default and maximum 4, kept low so bulk runs stay gentle on the Grizz API; the run stops at the first Grizz server error). Ignored in --dry-run."),
+    batch_size: int = typer.Option(100, "--batch-size", help="Accounts per batch; the run pauses between batches."),
+    pause: int = typer.Option(120, "--pause", help="Seconds to pause between batches (0 = no pause)."),
+    allow_high_concurrency: bool = typer.Option(False, "--allow-high-concurrency", help="Allow --concurrency above 4."),
 ):
     """Enrich CRM accounts from a CSV of account IDs using the Grizz API.
 
     Each account Grizz accepts counts as one enrichment call, including accounts
-    whose company is outside your plan (reported as `outside_plan`, nothing written)."""
+    whose company is outside your plan (reported as `outside_plan`, nothing written).
+    Accounts left to do are written to `<input>_rerun.csv` as the run goes; pass it
+    back as --input to finish them. Accounts already enriched are only written."""
     if crm not in ADAPTERS:
         console.print(f"[red]Unknown CRM '{crm}'. Available: {', '.join(ADAPTERS)}[/red]")
         raise typer.Exit(1)
-    run_enrich(crm, input, config, dry_run, concurrency)
+    run_enrich(crm, input, config, dry_run, concurrency, batch_size, pause,
+               allow_high_concurrency)
 
 
 # ── Interactive menu ───────────────────────────────────────────────────────────

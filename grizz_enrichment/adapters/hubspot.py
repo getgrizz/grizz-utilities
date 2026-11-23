@@ -41,12 +41,25 @@ class HubSpotAdapter(CRMAdapter):
             raise RuntimeError("HUBSPOT_API_KEY is invalid or lacks required scopes.")
         resp.raise_for_status()
 
+    def _send(self, method: str, url: str, max_retries: int = 3, **kwargs) -> requests.Response:
+        """One request, waiting out HubSpot's rate limit (429 + Retry-After) a few
+        times. A 429 still standing after that is returned for the caller to raise."""
+        for attempt in range(max_retries + 1):
+            resp = self._session.request(method, url, timeout=10, **kwargs)
+            if resp.status_code != 429 or attempt == max_retries:
+                return resp
+            try:
+                wait = float(resp.headers.get("Retry-After", ""))
+            except ValueError:
+                wait = 2 ** attempt
+            time.sleep(min(max(wait, 1.0), 60.0))
+        return resp
+
     def get_domain(self, record_id: str, domain_field: str) -> str | None:
         """Fetch a company record and return its domain field value."""
-        resp = self._session.get(
-            f"{_BASE_URL}/crm/v3/objects/companies/{record_id}",
+        resp = self._send(
+            "GET", f"{_BASE_URL}/crm/v3/objects/companies/{record_id}",
             params={"properties": domain_field},
-            timeout=10,
         )
         resp.raise_for_status()
         raw = resp.json().get("properties", {}).get(domain_field) or ""
@@ -54,10 +67,9 @@ class HubSpotAdapter(CRMAdapter):
 
     def update_record(self, record_id: str, fields: dict) -> None:
         """Patch a single company record with the provided fields."""
-        resp = self._session.patch(
-            f"{_BASE_URL}/crm/v3/objects/companies/{record_id}",
+        resp = self._send(
+            "PATCH", f"{_BASE_URL}/crm/v3/objects/companies/{record_id}",
             json={"properties": fields},
-            timeout=10,
         )
         resp.raise_for_status()
 

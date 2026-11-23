@@ -5,72 +5,277 @@ Handles the full submit → poll → fetch cycle.
 
 import os
 import random
+import threading
 import time
 
 import requests
+import urllib3
 
 from .domain_utils import clean_domain
 
 BASE_URL = "https://getgrizz.com"
 POLL_INTERVAL = 5   # seconds between status checks
-MAX_POLLS = 24      # give up after 2 minutes
+MAX_POLLS = 60      # give up after 5 minutes (a fresh enrichment can take ~3)
 
 # ── HTTP resilience ─────────────────────────────────────────────────────────
-# The enrich submit → poll → fetch cycle runs under concurrency (e.g. `run.py
-# enrich --concurrency 12`) and can hit endpoint throttling. Without retries a
-# single Read-timeout or 429 fails the whole record — that's what timed out
-# 79/100 at concurrency 12 near the tail of a large enrichment day. Retry
-# transient failures with JITTERED exponential backoff (the jitter de-syncs the
-# concurrent workers so they stop stampeding a throttled endpoint) and honor
-# Retry-After. Tunable via env; timeout defaults higher than the old hardcoded 30.
-DEFAULT_TIMEOUT = int(os.environ.get("GRIZZ_HTTP_TIMEOUT", "60"))
+# Two kinds of call, two retry policies:
+#
+# * Reads (status checks, result fetches, lookups) are free and safe to repeat.
+#   They are retried with jittered exponential backoff on timeouts, dropped
+#   connections, 429 and gateway errors (502/503/504). The jitter keeps
+#   concurrent workers from retrying in step.
+# * A submit counts against the monthly enrichment quota as soon as the server
+#   receives it, so it is retried ONLY when it provably never counted: the
+#   connection was never made, or the server answered 429/503 (it refused the
+#   request). After a read timeout or a 502/504 the server may already have
+#   accepted it, so the submit raises `SubmitUnknown` and is never re-sent here.
+#
+# A plain 500 is a server bug, not a blip: it is never retried.
+#
+# `RunGuard` (optional) lets a bulk run share one stop signal and one pause
+# across its workers: a gateway error pauses every worker, a second one in a
+# row stops the run, and every sleep checks the stop signal.
+DEFAULT_TIMEOUT = int(os.environ.get("GRIZZ_HTTP_TIMEOUT", "60"))     # read timeout, seconds
+SUBMIT_TIMEOUT = int(os.environ.get("GRIZZ_SUBMIT_TIMEOUT", "90"))    # read timeout for a submit
+CONNECT_TIMEOUT = 10
 _MAX_RETRIES = int(os.environ.get("GRIZZ_HTTP_RETRIES", "4"))
-_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
-_BACKOFF_CAP = 20   # seconds
+_READ_RETRY_STATUS = frozenset({429, 502, 503, 504})
+_SUBMIT_RETRY_STATUS = frozenset({429, 503})
+_GATEWAY_STATUS = frozenset({502, 503, 504})
+_BACKOFF_BASE = 2      # seconds
+_BACKOFF_CAP = 30      # seconds
+_RETRY_AFTER_MAX = 300  # honour a server's Retry-After up to this; longer means stop
+_GATEWAY_PAUSE = 15    # seconds every worker waits after a gateway error
+MONTHLY_LIMIT_DETAIL = "Monthly API call limit reached"
 
 
-def _retry_after_seconds(resp: "requests.Response", default: int) -> int:
-    """Seconds to wait from a 429 Retry-After header (integer count OR HTTP-date),
-    capped.  Falls back to `default` when the header is absent/unparseable."""
+class RunStopped(Exception):
+    """The run's stop signal was set while this call was waiting."""
+
+
+class MonthlyLimitReached(requests.HTTPError):
+    """The org's monthly enrichment quota is used up (a 429). Retrying won't help.
+    An HTTPError, so callers that catch HTTPError keep working."""
+
+
+class SubmitUnknown(Exception):
+    """A submit may or may not have been accepted (read timeout or 502/504).
+
+    Not retried, because a repeat would count against the quota again."""
+
+
+class ServerError(requests.HTTPError):
+    """The Grizz API is erroring (5xx after any allowed retry). Stop the run.
+    An HTTPError, so callers that catch HTTPError keep working."""
+
+    def __init__(self, msg: str, status: int = 0, response=None):
+        super().__init__(msg, response=response)
+        self.status = status
+
+
+class InFlight(Exception):
+    """The request was accepted but we couldn't see it finish (the poll timed
+    out, or a status check failed). Resume by `request_id`: checking and
+    fetching are free, a new submit is not."""
+
+    def __init__(self, msg: str, request_id: str):
+        super().__init__(msg)
+        self.request_id = request_id
+
+
+class PollTimeout(InFlight, TimeoutError):
+    """The request hadn't finished within the poll window."""
+
+
+class EnrichFailed(RuntimeError):
+    """The server finished the request with status FAILED. Re-running won't help."""
+
+    def __init__(self, msg: str, request_id: str):
+        super().__init__(msg)
+        self.request_id = request_id
+
+
+class RunGuard:
+    """Shared by the workers of one bulk run: a stop signal, a common pause
+    after a gateway error, and a cap on how fast submits go out."""
+
+    def __init__(self, submits_per_second: float = 1.0):
+        self.stop = threading.Event()
+        self.stop_reason = ""
+        self._lock = threading.Lock()
+        self._paused_until = 0.0
+        self._gateway_strikes = 0
+        self._min_gap = 1.0 / submits_per_second if submits_per_second > 0 else 0.0
+        self._next_submit = 0.0
+
+    def halt(self, reason: str) -> None:
+        with self._lock:
+            if not self.stop.is_set():
+                self.stop_reason = reason
+                self.stop.set()
+
+    def check(self) -> None:
+        if self.stop.is_set():
+            raise RunStopped(self.stop_reason)
+
+    def sleep(self, seconds: float) -> None:
+        """Sleep, waking early (and raising) if the run is stopped."""
+        if self.stop.wait(max(0.0, seconds)):
+            raise RunStopped(self.stop_reason)
+
+    def wait_turn(self) -> None:
+        """Before any request: honour a shared pause."""
+        self.check()
+        with self._lock:
+            wait = self._paused_until - time.monotonic()
+        if wait > 0:
+            self.sleep(wait)
+
+    def wait_submit_slot(self) -> None:
+        """Space submits out across all workers."""
+        self.wait_turn()
+        if not self._min_gap:
+            return
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_submit)
+            self._next_submit = slot + self._min_gap
+        if slot > now:
+            self.sleep(slot - now)
+
+    def gateway_error(self, status: int) -> bool:
+        """Record a gateway error. Returns True if one retry is allowed (the
+        first in a row); False means stop. Pauses every worker meanwhile."""
+        with self._lock:
+            self._gateway_strikes += 1
+            self._paused_until = max(self._paused_until, time.monotonic() + _GATEWAY_PAUSE)
+            strikes = self._gateway_strikes
+        if strikes > 1:
+            self.halt(f"the Grizz API returned {status} twice in a row")
+            return False
+        return True
+
+    def ok(self) -> None:
+        with self._lock:
+            self._gateway_strikes = 0
+
+
+def _retry_after_seconds(resp: "requests.Response", default: float) -> float | None:
+    """Seconds to wait from a Retry-After header (seconds OR HTTP-date).
+
+    Falls back to `default` when the header is absent or unparseable. Returns
+    None when the server asks for longer than `_RETRY_AFTER_MAX`: stop instead."""
     raw = (resp.headers.get("Retry-After") or "").strip()
     if not raw:
         return default
+    secs: float | None = None
     try:
-        return max(1, min(int(raw), _BACKOFF_CAP))
+        secs = float(raw)
     except ValueError:
-        pass
-    try:
-        from datetime import datetime, timezone
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(raw)
-        return max(1, min(int((dt - datetime.now(timezone.utc)).total_seconds()), _BACKOFF_CAP))
-    except Exception:
-        return default
-
-
-def _request(method: str, url: str, *, timeout: int | None = None, **kwargs) -> "requests.Response":
-    """requests.request with retry + jittered exponential backoff on TRANSIENT
-    failures (ReadTimeout / ConnectionError / 429 / 5xx).  Non-transient 4xx
-    responses are returned unretried for the caller to `_raise_with_body` — a bad
-    request is never retried.  Timeout defaults to GRIZZ_HTTP_TIMEOUT, retries to
-    GRIZZ_HTTP_RETRIES."""
-    timeout = DEFAULT_TIMEOUT if timeout is None else timeout
-    last_exc: Exception | None = None
-    for attempt in range(_MAX_RETRIES + 1):
         try:
-            resp = requests.request(method, url, timeout=timeout, **kwargs)
+            from datetime import datetime, timezone
+            from email.utils import parsedate_to_datetime
+            secs = (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds()
+        except Exception:
+            return default
+    if secs > _RETRY_AFTER_MAX:
+        return None
+    return max(1.0, secs)
+
+
+def _backoff(attempt: int) -> float:
+    """Full-jitter exponential backoff."""
+    return random.uniform(0, min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_CAP))
+
+
+def _never_sent(e: Exception) -> bool:
+    """True only if the request provably never reached the server."""
+    if isinstance(e, requests.exceptions.ConnectTimeout):
+        return True
+    if isinstance(e, requests.exceptions.ConnectionError) and not isinstance(e, requests.Timeout):
+        reason = getattr(e.args[0], "reason", None) if e.args else None
+        return isinstance(reason, urllib3.exceptions.NewConnectionError)
+    return False
+
+
+def _is_monthly_limit(resp: "requests.Response") -> bool:
+    if resp.status_code != 429:
+        return False
+    try:
+        return MONTHLY_LIMIT_DETAIL in str((resp.json() or {}).get("detail", ""))
+    except Exception:
+        return MONTHLY_LIMIT_DETAIL in (resp.text or "")
+
+
+def _request(method: str, url: str, *, timeout: float | None = None, submit: bool = False,
+             guard: RunGuard | None = None, **kwargs) -> "requests.Response":
+    """requests.request with the retry policy described above.
+
+    `submit=True` applies the never-count-twice policy. Non-retryable 4xx
+    responses are returned for the caller to `_raise_with_body`. With a
+    `guard`, every wait is cut short (RunStopped) when the run stops."""
+    read_timeout = (SUBMIT_TIMEOUT if submit else DEFAULT_TIMEOUT) if timeout is None else timeout
+    retry_status = _SUBMIT_RETRY_STATUS if submit else _READ_RETRY_STATUS
+    sleep = guard.sleep if guard else time.sleep
+    for attempt in range(_MAX_RETRIES + 1):
+        if guard:
+            guard.wait_turn()
+        last = attempt >= _MAX_RETRIES
+        try:
+            resp = requests.request(method, url, timeout=(CONNECT_TIMEOUT, read_timeout), **kwargs)
         except (requests.Timeout, requests.ConnectionError) as e:
-            last_exc = e
-            if attempt < _MAX_RETRIES:
-                time.sleep(min(2 ** attempt, _BACKOFF_CAP) + random.uniform(0, 1))
-                continue
-            raise
-        if resp.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES:
-            base = min(2 ** attempt, _BACKOFF_CAP) + random.uniform(0, 1)
-            time.sleep(_retry_after_seconds(resp, int(base)) if resp.status_code == 429 else base)
+            if submit and not _never_sent(e):
+                if guard:
+                    guard.halt("a submit got no reply from the Grizz API")
+                raise SubmitUnknown(f"no reply to the submit ({type(e).__name__}); "
+                                    "it may have been accepted") from e
+            if last:
+                raise
+            sleep(_backoff(attempt))
             continue
+
+        status = resp.status_code
+        if _is_monthly_limit(resp):
+            if guard:
+                guard.halt("the monthly enrichment limit is reached")
+            raise MonthlyLimitReached(MONTHLY_LIMIT_DETAIL, response=resp)
+        if submit and status >= 500 and status != 503:
+            # 500/502/504 can come after the server counted the submit.
+            if guard:
+                guard.halt(f"a submit got {status} from the Grizz API")
+            raise SubmitUnknown(f"the submit got {status}; it may have been accepted")
+        if status >= 500 and status not in _GATEWAY_STATUS:
+            if guard:
+                guard.halt(f"the Grizz API returned {status}")
+            raise ServerError(f"{status} from {url}", status, resp)
+
+        if status in retry_status:
+            if status in _GATEWAY_STATUS and guard:
+                # Bulk run: one shared pause, one retry, then stop.
+                if last or not guard.gateway_error(status):
+                    guard.halt(f"the Grizz API returned {status}")
+                    raise ServerError(f"{status} from {url} (twice in a row)", status, resp)
+                continue
+            if last:
+                if guard:
+                    guard.halt(f"the Grizz API kept returning {status}")
+                if status >= 500:
+                    raise ServerError(f"{status} from {url}", status, resp)
+                return resp
+            wait = _backoff(attempt)
+            if status in (429, 503):
+                wait = _retry_after_seconds(resp, wait)
+                if wait is None:
+                    if guard:
+                        guard.halt("the Grizz API asked to wait more than 5 minutes")
+                    raise ServerError(f"{status} from {url}: asked to wait more than "
+                                      f"{_RETRY_AFTER_MAX}s", status, resp)
+            sleep(wait)
+            continue
+        if guard and status < 500:
+            guard.ok()
         return resp
-    raise last_exc  # pragma: no cover
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _raise_with_body(resp: "requests.Response") -> None:
@@ -126,7 +331,8 @@ def _cascade_payload(company: dict) -> dict:
     return payload
 
 
-def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
+def submit(api_key: str, domain: str | None = None, *, guard: RunGuard | None = None,
+           **kwargs) -> dict:
     """Submit a single enrichment request.
 
     Pass any of the cascade-input fields (see the Grizz API docs):
@@ -139,7 +345,9 @@ def submit(api_key: str, domain: str | None = None, **kwargs) -> dict:
     if not payload:
         raise ValueError("submit() requires at least one cascade-input field.")
     url = f"{BASE_URL}/api/v1/companies/enrich/"
-    resp = _request("POST", url, json=payload, headers=_headers(api_key))
+    if guard:
+        guard.wait_submit_slot()
+    resp = _request("POST", url, json=payload, headers=_headers(api_key), submit=True, guard=guard)
     _raise_with_body(resp)
     return resp.json()
 
@@ -432,18 +640,19 @@ def get_people_audience_members(
     return resp.json()
 
 
-def poll_status(api_key: str, request_id: str) -> dict:
-    """Check the status of an in-flight enrichment request."""
+def poll_status(api_key: str, request_id: str, *, guard: RunGuard | None = None) -> dict:
+    """Check the status of an in-flight enrichment request. Free."""
     url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/"
-    resp = _request("GET", url, headers=_headers(api_key))
+    resp = _request("GET", url, headers=_headers(api_key), guard=guard)
     _raise_with_body(resp)
     return resp.json()
 
 
-def fetch_results(api_key: str, request_id: str) -> dict:
-    """Fetch enriched data for a completed request. Marks the result as retrieved."""
+def fetch_results(api_key: str, request_id: str, *, guard: RunGuard | None = None) -> dict:
+    """Fetch the results of a completed request. Free, and can be fetched again
+    later (e.g. by a re-run whose CRM write failed)."""
     url = f"{BASE_URL}/api/v1/companies/enrich/{request_id}/results/"
-    resp = _request("GET", url, headers=_headers(api_key))
+    resp = _request("GET", url, headers=_headers(api_key), guard=guard)
     _raise_with_body(resp)
     return resp.json()
 
@@ -464,37 +673,66 @@ def is_outside_plan(payload: dict | None) -> bool:
             or p.get("status") == OUTSIDE_PLAN)
 
 
-def enrich_detailed(api_key: str, domain: str | None = None, on_status=None, **kwargs) -> dict:
+def enrich_detailed(api_key: str, domain: str | None = None, on_status=None, *,
+                    guard: RunGuard | None = None, request_id: str | None = None,
+                    on_submitted=None, **kwargs) -> dict:
     """Like `enrich`, but says *why* there's no company.
 
     Returns {"company": dict | None, "outside_plan": bool, "plan": str | None,
              "request_id": str}.
-    Each call counts as one enrichment call, outside_plan results included.
+    Each submit counts as one enrichment call, outside_plan results included.
+
+    Pass `request_id` to resume an accepted request instead of submitting a new
+    one: checking and fetching are free. `on_submitted(request_id)` is called as
+    soon as a submit is accepted, so a caller can record it before polling.
+
+    Raises (besides requests.HTTPError for a rejected submit):
+        SubmitUnknown: the submit may have been accepted; not re-sent.
+        InFlight / PollTimeout: accepted, outcome not seen; carries `request_id`.
+        EnrichFailed: finished as FAILED; carries `request_id`.
+        MonthlyLimitReached, ServerError, RunStopped.
     """
-    data = submit(api_key, domain=domain, **kwargs)
-    request_id = data["id"]
-    status = data["status"]
-
-    polls = 0
-    while status not in ("COMPLETE", "FAILED") and polls < MAX_POLLS:
-        time.sleep(POLL_INTERVAL)
-        polls += 1
-        data = poll_status(api_key, request_id)
+    if request_id is None:
+        data = submit(api_key, domain=domain, guard=guard, **kwargs)
+        request_id = data["id"]
         status = data["status"]
-        if on_status:
-            on_status(status)
+        if on_submitted:
+            on_submitted(request_id)
+    else:
+        status = None
 
-    if status == "FAILED":
-        raise RuntimeError(f"Enrichment failed: {data.get('error_detail', 'unknown error')}")
+    sleep = guard.sleep if guard else time.sleep
+    try:
+        polls = 0
+        if status is None:
+            data = poll_status(api_key, request_id, guard=guard)
+            status = data["status"]
+        while status not in ("COMPLETE", "FAILED") and polls < MAX_POLLS:
+            sleep(POLL_INTERVAL)
+            polls += 1
+            data = poll_status(api_key, request_id, guard=guard)
+            status = data["status"]
+            if on_status:
+                on_status(status)
 
-    if status != "COMPLETE":
-        raise TimeoutError(
-            f"Timed out after {polls} polls (last status: {status}). "
-            f"Check manually: GET {BASE_URL}/api/v1/companies/enrich/{request_id}/"
-        )
+        if status == "FAILED":
+            raise EnrichFailed(f"Enrichment failed: {data.get('error_detail') or 'unknown error'}",
+                               request_id)
+        if status != "COMPLETE":
+            raise PollTimeout(f"not finished after {polls * POLL_INTERVAL}s "
+                              f"(last status: {status})", request_id)
 
-    results = fetch_results(api_key, request_id)
-    outside = is_outside_plan(results) or is_outside_plan(data)
+        results = fetch_results(api_key, request_id, guard=guard)
+        if not isinstance(results, dict) or not isinstance(data, dict):
+            raise ValueError("unexpected response shape")
+        outside = is_outside_plan(results) or is_outside_plan(data)
+    except (EnrichFailed, InFlight):
+        raise
+    except Exception as e:
+        # Accepted, but we lost sight of it: resume by id, never re-submit.
+        err = InFlight(f"{type(e).__name__}: {e}", request_id)
+        err.cause = e
+        raise err from e
     return {"company": None if outside else (results.get("company") or None),
             "outside_plan": outside, "plan": results.get("plan") if outside else None,
             "request_id": request_id}
@@ -515,8 +753,8 @@ def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) ->
         outside the caller's plan (use `enrich_detailed` to tell them apart).
 
     Raises:
-        RuntimeError:  If the request fails.
-        TimeoutError:  If polling exceeds MAX_POLLS.
+        RuntimeError:  If the request fails (EnrichFailed).
+        TimeoutError:  If polling exceeds MAX_POLLS (PollTimeout).
         requests.HTTPError: On API errors.
     """
     return enrich_detailed(api_key, domain=domain, on_status=on_status, **kwargs)["company"]

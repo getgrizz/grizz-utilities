@@ -154,8 +154,9 @@ attio:
     # Attio location attributes are OBJECT-TYPED — one attribute holds
     # city + region + country. Map the three source fields to sub-fields of a
     # single location attribute (dotted slug) and the tool collapses them into
-    # one Attio location value on write. Point them at the native
-    # `primary_location` instead to populate Attio's built-in location attribute.
+    # one Attio location value on write. Keep them on a grizz_* attribute: sync
+    # writes only Grizz attributes on existing records, never native ones such as
+    # Attio's built-in `primary_location`.
     city:                  grizz_location.locality
     state_province_region: grizz_location.region
     country:               grizz_location.country_code
