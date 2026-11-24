@@ -10,6 +10,8 @@ This project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- **lookup: `match_via` value `fuzzy` is now `company_name`** (matched on company
+  name and location). Enrichment failures report a plain retry message.
 - **HubSpot and Salesforce contact sync is now client-side.** `people sync --crm
   hubspot|salesforce` writes from this machine with your own credentials, the same
   model as companies and Attio. Your CRM credentials are never sent to Grizz. The

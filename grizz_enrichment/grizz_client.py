@@ -422,7 +422,7 @@ def lookup_batch(api_key: str, lookups: list[dict]) -> list[dict]:
         {
           "input":     {...},
           "matched":   bool,
-          "match_via": "gid_company" | "grizz_id" | "domain" | "fuzzy" | null,
+          "match_via": "gid_company" | "grizz_id" | "domain" | "company_name" | null,
           "company":   {gid_company, domain, company_name, naics,
                          employee_range, ...} | null
         }
@@ -716,7 +716,7 @@ def enrich_detailed(api_key: str, domain: str | None = None, on_status=None, *,
                 on_status(status)
 
         if status == "FAILED":
-            raise EnrichFailed(f"Enrichment failed: {data.get('error_detail') or 'unknown error'}",
+            raise EnrichFailed("The company could not be enriched. Retry with the company name and location.",
                                request_id)
         if status != "COMPLETE":
             raise PollTimeout(f"not finished after {polls * POLL_INTERVAL}s "
@@ -854,7 +854,7 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
 
         if st == "FAILED":
             failed.append({"input": raw_input, "request_id": request_id,
-                           "error": req.get("error_detail", "")})
+                           "error": "The company could not be enriched. Retry with the company name and location."})
             continue
         if st != "COMPLETE":
             failed.append({"input": raw_input, "request_id": request_id,
