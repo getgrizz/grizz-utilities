@@ -326,11 +326,11 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
 
         rid = res["request_id"]
         if res["outside_plan"]:
-            # In Grizz, but not in this account's plan: nothing to write, don't re-enrich it.
+            # Not included in this account's current plan: nothing to write, don't re-enrich it.
             return (aid, "outside_plan", domain, None)
         grizz_data = res["company"]
         if grizz_data is None:
-            return (aid, "no_data", domain, None)
+            return (aid, "thin_data", domain, None)
         # Built from the current config.yaml every time, never replayed.
         # Stamped only when the record is actually written, and only if
         # config.yaml maps `last_sync` — see _grizz_data.
@@ -474,7 +474,7 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
     outcome_colors = {
         "success": "green",
         "dry_run": "cyan",
-        "no_data": "yellow",
+        "thin_data": "yellow",
         "skipped": "yellow",
         "no_updates": "yellow",
         "outside_plan": "magenta",
@@ -510,12 +510,14 @@ def run_enrich(crm: str, input_file: Path, config_path: Path, dry_run: bool,
     )
     failed = sum(1 for _, o, _ in summary if o == "failed")
     if failed:
-        console.print(f"[yellow]{failed} account(s) couldn't be enriched[/yellow] "
-                      f"(not in the rerun file: re-running them won't help).")
+        console.print(f"[yellow]{failed} account(s) weren't updated: our data on them is thin[/yellow] "
+                      f"(not in the rerun file). If an account's CRM domain isn't the company's current "
+                      f"website, update it and re-run a CSV of just those account IDs to re-compile it "
+                      f"(each re-run account is a new enrichment call).")
     outside = sum(1 for _, o, _ in summary if o == "outside_plan")
     if outside:
-        console.print(f"[magenta]{outside} account(s) are in Grizz but outside your plan[/magenta] "
-                      f"(no data written; each still counted as an enrichment call). "
+        console.print(f"[magenta]{outside} account(s) aren't included in your current plan[/magenta] "
+                      f"(nothing written; each still counted as an enrichment call). "
                       f"Contact Grizz to expand your plan.")
 
 
@@ -736,7 +738,7 @@ def _read_gids(path: Path) -> list[str]:
 
 def _validated_gids(gids: list[str], path: Path) -> list[str]:
     """Drop values that are not Grizz company gids, loudly.  Downstream these
-    would come back as `returned no data — skipped`, which reads like a Grizz
+    would come back as `thin data — skipped`, which reads like a Grizz
     coverage gap rather than a malformed input file."""
     good = [g for g in gids if g.upper().startswith("GC")]
     bad = [g for g in gids if not g.upper().startswith("GC")]
@@ -881,12 +883,12 @@ def run_lookup(input_path: Path, out: Path | None, companies_out: Path | None) -
     table.add_column("%", justify="right")
     table.add_row("matched", str(hits), f"{100 * hits / len(rows):.1f}%")
     if outside:
-        # In Grizz, outside the plan: enriching them won't return data, so don't suggest it.
-        table.add_row("outside your plan", str(outside), f"{100 * outside / len(rows):.1f}%")
-    table.add_row("no match", str(misses), f"{100 * misses / len(rows):.1f}%")
+        # Not included in the current plan: enriching them won't change that, so don't suggest it.
+        table.add_row("not in your current plan", str(outside), f"{100 * outside / len(rows):.1f}%")
+    table.add_row("thin data", str(misses), f"{100 * misses / len(rows):.1f}%")
     console.print(table)
     if outside:
-        console.print("[magenta]Companies outside your plan are in Grizz; enriching them returns no data. "
+        console.print("[magenta]Some companies aren't included in your current plan; re-enriching won't add them. "
                       "Contact Grizz to expand your plan.[/magenta]")
     console.print(f"Distinct companies matched: {len(companies)}  |  "
                   f"match_via: {via or '—'}  |  {time.time() - t0:.0f}s")
@@ -925,10 +927,12 @@ def _companies_from_gids(api_key: str, gids: list[str]) -> list[dict]:
         c["email"] = c.pop("hq_email", "") or ""
         companies.append(c)
     if unmatched:
-        console.print(f"  [yellow]{unmatched} compan(ies) returned no data — skipped.[/yellow]")
+        console.print(f"  [yellow]{unmatched} compan(ies) have thin data on the platform — skipped. "
+                      f"If an account's CRM domain isn't the company's current website, update it and "
+                      f"re-run `run.py enrich` on a CSV of just those accounts to re-compile them.[/yellow]")
     if outside:
-        console.print(f"  [magenta]{outside} compan(ies) are outside your plan — skipped "
-                      f"(no data written). Contact Grizz to expand your plan.[/magenta]")
+        console.print(f"  [magenta]{outside} compan(ies) aren't included in your current plan — skipped "
+                      f"(nothing written). Contact Grizz to expand your plan.[/magenta]")
     return companies
 
 
@@ -1012,8 +1016,8 @@ def run_write(
     outside_n = sum(1 for r in results if not r.get("matched") and r.get("outside_plan"))
     console.print(f"Read [bold]{len(results)}[/bold] lookup result(s): "
                   f"[green]{len(hits)} matched[/green], "
-                  + (f"[magenta]{outside_n} outside your plan[/magenta] (not written), " if outside_n else "")
-                  + f"{len(results) - len(hits) - outside_n} no match.")
+                  + (f"[magenta]{outside_n} not in your current plan[/magenta] (not written), " if outside_n else "")
+                  + f"{len(results) - len(hits) - outside_n} thin data.")
     if no_id:
         console.print(
             f"  [yellow]{len(no_id)} matched row(s) carry no record_id and cannot be "
@@ -1503,7 +1507,7 @@ def _resolve_gids(api_key: str, rows: list[dict]) -> tuple[int, list[dict], list
     lookup — so every company keys on a Grizz company and round-trips cleanly
     (this also collapses franchise/redirect domains onto the canonical company).
     Mutates rows in place; returns (resolved_count, still_unresolved_rows,
-    outside_plan_rows). Outside-plan rows are in Grizz but outside the caller's
+    outside_plan_rows). Outside-plan rows aren't included in the caller's
     plan: the lookup returns no company for them, but their people can still be
     discovered, by domain."""
     need = [r for r in rows if not r["gid_company"] and r["domain"]]
@@ -1583,7 +1587,7 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
     if resolved:
         console.print(f"Resolved [bold]{resolved}[/bold] domain-only row(s) to a Grizz company.")
     if outside:
-        console.print(f"[magenta]{len(outside)} row(s) are outside your plan[/magenta] — their company "
+        console.print(f"[magenta]{len(outside)} row(s) aren't included in your current plan[/magenta] — their company "
                       f"data isn't included, but their people are still discovered (by domain).")
     if unresolved:
         console.print(f"[yellow]{len(unresolved)} row(s) have no gid and no resolvable domain — "
@@ -1701,10 +1705,11 @@ def run_people_discover(input_file: Path, out_dir: Path, prompt: str,
                       f"(parent/dedup) — dropped as unattributable.[/yellow]")
     if failed_batches:
         console.print(f"[yellow]{failed_batches} batch(es) failed/timed out — re-run with --resume.[/yellow]")
-        console.print("[yellow]Those companies were NOT searched. checked.json lists every input "
-                      "company, so treat it as the roster — not as proof of coverage.[/yellow]")
+        console.print("[yellow]Those companies were not compiled into this run; re-run with --resume "
+                      "to compile them. Don't load checked.json until a --resume run finishes, or those "
+                      "companies will read as having no contacts.[/yellow]")
     console.print(f"\nWrote:\n  {contacts_path}  (per-contact, keyed to each CRM record)"
-                  f"\n  {checked_path}   (coverage roster — every company checked, found or not)"
+                  f"\n  {checked_path}   (roster — every input company, including any still to compile)"
                   f"\n  {csv_path}  (human review)")
     console.print("\ncontacts.json + checked.json are the discovery hand-off; feed them to "
                   "your contact-log loader before the paid email/phone enrich step.")
@@ -2524,7 +2529,7 @@ def enrich(
     """Enrich CRM accounts from a CSV of account IDs using the Grizz API.
 
     Each account Grizz accepts counts as one enrichment call, including accounts
-    whose company is outside your plan (reported as `outside_plan`, nothing written).
+    whose company isn't included in your current plan (reported as `outside_plan`, nothing written).
     Accounts left to do are written to `<input>_rerun.csv` as the run goes; pass it
     back as --input to finish them. Accounts already enriched are only written."""
     if crm not in ADAPTERS:

@@ -716,7 +716,7 @@ def enrich_detailed(api_key: str, domain: str | None = None, on_status=None, *,
                 on_status(status)
 
         if status == "FAILED":
-            raise EnrichFailed("The company could not be enriched. Retry with the company name and location.",
+            raise EnrichFailed("Our data on this company is thin and omitted from the platform. If the domain sent isn't the company's current website, enrich again with the current one to re-compile its data.",
                                request_id)
         if status != "COMPLETE":
             raise PollTimeout(f"not finished after {polls * POLL_INTERVAL}s "
@@ -749,7 +749,7 @@ def enrich(api_key: str, domain: str | None = None, on_status=None, **kwargs) ->
     unchanged.
 
     Returns:
-        Results dict on success, None if there's no company data: not found, or
+        Results dict on success, None when there's no company record to return: thin data, or
         outside the caller's plan (use `enrich_detailed` to tell them apart).
 
     Raises:
@@ -819,7 +819,7 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
         {
           "matched":     [{"input": {...}, "company": {...}, "request_id": "..."}],
           "no_match":    [{"input": {...}, "request_id": "..."}],
-          "outside_plan":[{"input": {...}, "request_id": "..."}],   # in Grizz, not in your plan
+          "outside_plan":[{"input": {...}, "request_id": "..."}],   # not included in your current plan
           "low_conf":    [{"input": {...}, "request_id": "..."}],
           "failed":      [{"input": {...}, "request_id": "...", "error": "..."}],
           "rejected":    [...],                 # passed through from bulk endpoint
@@ -854,7 +854,7 @@ def enrich_bulk(api_key: str, companies: list[dict]) -> dict:
 
         if st == "FAILED":
             failed.append({"input": raw_input, "request_id": request_id,
-                           "error": "The company could not be enriched. Retry with the company name and location."})
+                           "error": "Our data on this company is thin and omitted from the platform. If the domain sent isn't the company's current website, enrich again with the current one to re-compile its data."})
             continue
         if st != "COMPLETE":
             failed.append({"input": raw_input, "request_id": request_id,
